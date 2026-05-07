@@ -1,0 +1,1071 @@
+name: Zedge Safe Automation + Realtime DB Wallpaper & Ringtone
+
+on:
+  workflow_dispatch:
+    inputs:
+      proxy_server:
+        description: "HTTP proxy host:port"
+        required: true
+      proxy_user:
+        description: "Proxy username"
+        required: false
+      proxy_pass:
+        description: "Proxy password"
+        required: false
+      zedge_email:
+        description: "Zedge email"
+        required: true
+      zedge_password:
+        description: "Zedge password"
+        required: true
+      headless:
+        description: "Run headless? true/false"
+        required: true
+        default: "false"
+      total_profiles:
+        description: "Number of Zedge profiles to rotate through (e.g. 1, 2, 3, 6)"
+        required: false
+        default: "3"
+
+jobs:
+  automation:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright
+        shell: pwsh
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install chromium
+
+      - name: Create bot.js
+        shell: pwsh
+        run: |
+          @'
+          const { chromium } = require("playwright");
+          const fs = require("fs");
+          const path = require("path");
+
+          const proxyServer = process.env.PROXY_SERVER;
+          const proxyUser = process.env.PROXY_USER;
+          const proxyPass = process.env.PROXY_PASS;
+          const zedgeEmail = process.env.ZEDGE_EMAIL;
+          const zedgePassword = process.env.ZEDGE_PASSWORD;
+          const isHeadless = process.env.HEADLESS === "true";
+
+          const firebaseDatabaseURL = "https://zedge-automation-3-default-rtdb.asia-southeast1.firebasedatabase.app";
+          const queuePath = "wallpaperQueue";
+
+          if (!proxyServer) throw new Error("Proxy server is required");
+          if (!zedgeEmail) throw new Error("Zedge email is required");
+          if (!zedgePassword) throw new Error("Zedge password is required");
+
+          const proxy = {
+            server: proxyServer.startsWith("http")
+              ? proxyServer
+              : `http://${proxyServer}`,
+          };
+
+          if (proxyUser && proxyPass) {
+            proxy.username = proxyUser;
+            proxy.password = proxyPass;
+          }
+
+          async function firebaseGet(pathName) {
+            const res = await fetch(`${firebaseDatabaseURL}/${pathName}.json`);
+            if (!res.ok) throw new Error(`Firebase GET failed: ${res.status}`);
+            return await res.json();
+          }
+
+          async function firebasePatch(pathName, data) {
+            const res = await fetch(`${firebaseDatabaseURL}/${pathName}.json`, {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(data)
+            });
+            if (!res.ok) throw new Error(`Firebase PATCH failed: ${res.status}`);
+            return await res.json();
+          }
+
+          async function firebaseDelete(pathName) {
+            const res = await fetch(`${firebaseDatabaseURL}/${pathName}.json`, {
+              method: "DELETE"
+            });
+            if (!res.ok) throw new Error(`Firebase DELETE failed: ${res.status}`);
+            console.log(`Deleted from Firebase: ${pathName}`);
+          }
+
+          // --- PROFILE ROTATION STATE MANAGER ---
+
+          // Returns the next profile index whose upload count is still below perProfileLimit.
+          // Returns -1 if every profile has reached its limit for today.
+          function getNextAvailableProfile(lastUsedIndex, uploadCounts, total, perProfileLimit) {
+            let next = (lastUsedIndex + 1) % total;
+            for (let i = 0; i < total; i++) {
+              if ((uploadCounts[next] || 0) < perProfileLimit) return next;
+              next = (next + 1) % total;
+            }
+            return -1; // all profiles at their limit
+          }
+
+          async function getProfileState(totalProfilesCount) {
+            console.log("Checking profile rotation state...");
+            
+            // Get current date in Dhaka timezone (e.g. "5/1/2026")
+            const today = new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka" }).split(",")[0];
+            
+            let state;
+            try {
+              state = await firebaseGet("uploadState");
+            } catch (e) {
+              state = null;
+            }
+
+            if (!state) {
+              state = {
+                lastUploadDate: "",
+                totalUploadsToday: 0,
+                lastUsedProfileIndex: -1,
+                totalProfilesAvailable: totalProfilesCount,
+                profileUploadCounts: {}
+              };
+            }
+
+            state.totalProfilesAvailable = totalProfilesCount;
+
+            // Backward-compat: older records may have profilesUsedToday array instead
+            if (typeof state.profileUploadCounts !== "object" || Array.isArray(state.profileUploadCounts)) {
+              state.profileUploadCounts = {};
+            }
+
+            if (state.lastUploadDate !== today) {
+              console.log("New day detected! Resetting daily upload count and profile usage.");
+              state.lastUploadDate = today;
+              state.totalUploadsToday = 0;
+              state.profileUploadCounts = {};
+              // lastUsedProfileIndex is intentionally NOT reset here so the rotation
+              // continues from where it left off across days.
+              // e.g. 6 profiles, limit 3/day: Day1→0,1,2  Day2→3,4,5  Day3→0,1,2 ...
+            }
+
+            const ZEDGE_DAILY_LIMIT = 3; // Zedge max uploads per day
+            if (state.totalUploadsToday >= ZEDGE_DAILY_LIMIT) {
+              console.log(`🛑 Zedge daily limit of ${ZEDGE_DAILY_LIMIT} uploads reached. Exiting safely.`);
+              process.exit(0); 
+            }
+
+            // How many uploads each profile may do today.
+            // Spreads the daily limit as evenly as possible across available profiles:
+            //   1 profile  → 3 uploads each
+            //   2 profiles → 2 uploads for first, 1 for second  (total = 3)
+            //   3+ profiles → 1 upload each
+            const perProfileLimit = Math.ceil(ZEDGE_DAILY_LIMIT / totalProfilesCount);
+
+            const nextProfileIndex = getNextAvailableProfile(state.lastUsedProfileIndex, state.profileUploadCounts, totalProfilesCount, perProfileLimit);
+
+            if (nextProfileIndex === -1) {
+              console.log("🛑 All profiles have reached their daily upload limit. Exiting safely.");
+              process.exit(0);
+            }
+
+            const countsDisplay = Object.entries(state.profileUploadCounts).map(([k,v]) => `P${k}:${v}`).join(", ") || "none";
+            console.log(`Upload counts today: {${countsDisplay}} | Per-profile limit: ${perProfileLimit} | Next: ${nextProfileIndex}`);
+            return { state, nextProfileIndex, perProfileLimit };
+          }
+
+          async function updateProfileStateAfterUpload(state, usedProfileIndex) {
+            console.log(`Updating state: Profile ${usedProfileIndex} was used. Total today is now ${state.totalUploadsToday + 1}`);
+            
+            const profileUploadCounts = { ...(state.profileUploadCounts || {}) };
+            profileUploadCounts[usedProfileIndex] = (profileUploadCounts[usedProfileIndex] || 0) + 1;
+
+            await firebasePatch("uploadState", {
+              lastUploadDate: state.lastUploadDate,
+              totalUploadsToday: state.totalUploadsToday + 1,
+              lastUsedProfileIndex: usedProfileIndex,
+              totalProfilesAvailable: state.totalProfilesAvailable,
+              profileUploadCounts
+            });
+          }
+          // ----------------------------------------
+
+          async function getNextWallpaperFromRealtimeDB() {
+            console.log("Checking Firebase Realtime Database queue...");
+            const data = await firebaseGet(queuePath);
+            if (!data) throw new Error("No items found in Realtime Database");
+
+            const entries = Object.entries(data)
+              .filter(([id, item]) => item && item.status === "queued" && (item.fileBase64 || item.imageBase64))
+              .sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
+
+            if (!entries.length) throw new Error("No queued item found");
+
+            const [id, item] = entries[0];
+            const localDir = path.join(process.cwd(), "downloads");
+            fs.mkdirSync(localDir, { recursive: true });
+            
+            const isMp3 = item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3"));
+            const ext = isMp3 ? ".mp3" : ".jpg";
+            const localFile = path.join(localDir, `${id}${ext}`);
+
+            console.log(`Saving queued item: ${item.name || id} as ${ext}`);
+            const base64Data = item.fileBase64 || item.imageBase64;
+            const base64 = base64Data.includes(",")
+              ? base64Data.split(",")[1]
+              : base64Data;
+
+            fs.writeFileSync(localFile, Buffer.from(base64, "base64"));
+
+            await firebasePatch(`${queuePath}/${id}`, {
+              status: "processing",
+              processingAt: Date.now()
+            });
+
+            return {
+              id,
+              localFile,
+              isMp3,
+              name:        item.name || id,
+              title:       item.title || "",
+              tags:        item.tags || "",
+              category:    item.category || "",
+              description: item.description || ""
+            };
+          }
+
+          async function markWallpaperDoneAndDelete(id, name) {
+            console.log(`Upload successful — deleting "${name}" from Firebase...`);
+            await firebaseDelete(`${queuePath}/${id}`);
+            console.log(`"${name}" permanently removed from Firebase queue`);
+          }
+
+          async function markWallpaperFailed(id, error) {
+            await firebasePatch(`${queuePath}/${id}`, {
+              status: "failed",
+              error: String(error).slice(0, 1000),
+              failedAt: Date.now()
+            });
+          }
+
+          async function getProxyTimezone(browser) {
+            const providers = [
+              { url: "https://ipwho.is/", parse: d => d.timezone?.id },
+              { url: "https://ipinfo.io/json", parse: d => d.timezone },
+              { url: "http://ip-api.com/json", parse: d => d.timezone }
+            ];
+
+            for (const provider of providers) {
+              let ctx;
+              try {
+                ctx = await browser.newContext({ ignoreHTTPSErrors: true });
+                const page = await ctx.newPage();
+                console.log(`Checking timezone via ${provider.url}`);
+                await page.goto(provider.url, { waitUntil: "domcontentloaded" });
+                const text = await page.locator("body").innerText();
+                if (!text || !text.trim().startsWith("{")) throw new Error("Response is not JSON");
+                const data = JSON.parse(text);
+                const tz = provider.parse(data);
+                if (!tz) throw new Error("No timezone found");
+                await ctx.close();
+                console.log(`Detected timezone: ${tz}`);
+                return tz;
+              } catch (err) {
+                console.log(`Timezone provider failed: ${err.message}`);
+                if (ctx) await ctx.close().catch(() => {});
+              }
+            }
+
+            console.log("Using fallback timezone: Asia/Dhaka");
+            return "Asia/Dhaka";
+          }
+
+          async function safeClick(locator, label, timeout = 30000) {
+            console.log(`Clicking ${label}`);
+            await locator.waitFor({ state: "visible", timeout });
+            await locator.scrollIntoViewIfNeeded();
+            await locator.click();
+          }
+
+          async function safeType(locator, value, label) {
+            console.log(`Typing ${label}`);
+            await locator.waitFor({ state: "visible" });
+            await locator.scrollIntoViewIfNeeded();
+            await locator.click();
+            await locator.fill("");
+            await locator.pressSequentially(value, { delay: 90 });
+          }
+
+          async function scrollFullPage(page) {
+            await page.evaluate(async () => {
+              await new Promise(resolve => {
+                let lastY = -1;
+                const step = () => {
+                  window.scrollBy(0, 500);
+                  if (window.scrollY === lastY || window.scrollY + window.innerHeight >= document.body.scrollHeight) {
+                    resolve();
+                    return;
+                  }
+                  lastY = window.scrollY;
+                  requestAnimationFrame(step);
+                };
+                step();
+              });
+            });
+          }
+
+          async function scrollToElement(locator) {
+            await locator.waitFor({ state: "attached" });
+            await locator.evaluate(el => {
+              el.scrollIntoView({ block: "center", inline: "center" });
+            });
+          }
+
+          async function forceCheckByDataHook(page, dataHookValue, label) {
+            console.log(`Force checking: ${label}`);
+
+            await page.waitForSelector(
+              `input[data-hook="${dataHookValue}-input"]`,
+              { state: "attached", timeout: 30000 }
+            );
+
+            await page.evaluate((hook) => {
+              const input = document.querySelector(`input[data-hook="${hook}-input"]`);
+              if (!input) throw new Error(`Checkbox input not found: ${hook}`);
+              input.click();
+            }, dataHookValue);
+
+            const isChecked = await page.evaluate((hook) => {
+              const input = document.querySelector(`input[data-hook="${hook}-input"]`);
+              return input ? input.checked : false;
+            }, dataHookValue);
+
+            if (!isChecked) {
+              console.log(`${label} not checked after click — forcing via JS property`);
+              await page.evaluate((hook) => {
+                const input = document.querySelector(`input[data-hook="${hook}-input"]`);
+                if (!input) throw new Error(`Checkbox input not found: ${hook}`);
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                  window.HTMLInputElement.prototype, "checked"
+                ).set;
+                nativeInputValueSetter.call(input, true);
+                input.dispatchEvent(new Event("click", { bubbles: true }));
+                input.dispatchEvent(new Event("change", { bubbles: true }));
+                input.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+                input.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+              }, dataHookValue);
+            }
+
+            const finalChecked = await page.evaluate((hook) => {
+              const input = document.querySelector(`input[data-hook="${hook}-input"]`);
+              return input ? input.checked : false;
+            }, dataHookValue);
+
+            if (!finalChecked) throw new Error(`Failed to check checkbox: ${label}`);
+            console.log(`${label} confirmed checked`);
+          }
+
+          async function uploadWallpaperInDialog(page, localFile) {
+            console.log("Waiting for Upload dialog (with file input inside)");
+
+            // Wait specifically for an upload dialog that contains the file input — not the type-selection menu
+            let dialog;
+            try {
+              await page.waitForSelector(
+                'input[data-hook="form-field-files-input"]',
+                { state: "attached", timeout: 30000 }
+              );
+              console.log("Upload dialog detected via file input");
+              dialog = page.locator('[role="dialog"]').filter({ has: page.locator('input[data-hook="form-field-files-input"]') }).first();
+              if (!(await dialog.count())) {
+                // Fallback: maybe it's a full page instead of dialog
+                console.log("No dialog wrapper found — treating whole page as upload form");
+                dialog = page.locator("body");
+              }
+            } catch (e) {
+              await page.screenshot({ path: "zedge-dialog-error.png", fullPage: true });
+              throw new Error(`Upload dialog did not appear after 30s. Check zedge-dialog-error.png. Original: ${e.message}`);
+            }
+            await page.waitForTimeout(1000);
+
+            await forceCheckByDataHook(page, "form-field-accept-input", "first ownership checkbox");
+            await page.waitForTimeout(500);
+
+            await forceCheckByDataHook(page, "form-field-acceptContentPolicy-input", "second content policy checkbox");
+            await page.waitForTimeout(500);
+
+            console.log("Waiting for file input");
+            const fileInput = dialog
+              .locator('input[data-hook="form-field-files-input"]')
+              .first();
+
+            await fileInput.waitFor({ state: "attached" });
+            console.log("Uploading file");
+            await fileInput.setInputFiles(localFile);
+
+            await page.waitForFunction(() => {
+              const input = document.querySelector('input[data-hook="form-field-files-input"]');
+              return input && input.files && input.files.length > 0;
+            });
+
+            console.log("Waiting for Upload button to become enabled");
+            const uploadButton = dialog
+              .locator('button[type="submit"]:has-text("Upload")')
+              .first();
+
+            await uploadButton.waitFor({ state: "visible" });
+            await scrollToElement(uploadButton);
+
+            await page.waitForFunction(() => {
+              const buttons = [...document.querySelectorAll('button[type="submit"]')];
+              const upload = buttons.find(btn => btn.textContent.trim() === "Upload");
+              return upload && upload.disabled === false;
+            });
+
+            await uploadButton.click();
+
+            console.log("Waiting for Edit meta button");
+            const editMetaButton = page
+              .locator('[role="dialog"] button:has-text("Edit meta")')
+              .first();
+
+            await editMetaButton.waitFor({ state: "visible" });
+
+            await page.waitForFunction(() => {
+              const buttons = [...document.querySelectorAll("button")];
+              const editMeta = buttons.find(btn => btn.textContent.trim() === "Edit meta");
+              return editMeta && editMeta.disabled === false;
+            });
+
+            await scrollToElement(editMetaButton);
+            await editMetaButton.click();
+            console.log("Clicked Edit meta");
+          }
+
+          async function fillMetaDialog(page, meta) {
+            console.log("Waiting for meta dialog to open");
+
+            await page.waitForSelector(
+              'input[data-hook="form-field-name-input"]',
+              { state: "visible", timeout: 30000 }
+            );
+
+            await page.waitForTimeout(800);
+
+            // ── TITLE ──────────────────────────────────────────────
+            console.log("Filling title");
+            const titleInput = page.locator('input[data-hook="form-field-name-input"]').first();
+            await titleInput.waitFor({ state: "visible" });
+            await scrollToElement(titleInput);
+            await titleInput.click();
+            
+            const title = String(meta.title || "").slice(0, 30);
+            await titleInput.fill(title);
+            await titleInput.press('Tab'); 
+            await page.waitForTimeout(300);
+            console.log(`Title filled: "${title}"`);
+
+            // ── TAGS ───────────────────────────────────────────────
+            if (meta.tags) {
+              const tagList = String(meta.tags)
+                .split(",")
+                .map(t => t.trim())
+                .filter(Boolean)
+                .filter(t => t.length >= 2)
+                .slice(0, 10);
+
+              console.log(`Filling ${tagList.length} valid tags`);
+              
+              const tagsInput = page.locator('.react-select__input').nth(0);
+
+              for (const tag of tagList) {
+                await tagsInput.waitFor({ state: "attached" });
+                await scrollToElement(tagsInput);
+                await tagsInput.click({ force: true });
+                await tagsInput.fill(tag);
+                await page.waitForTimeout(300);
+                await tagsInput.press("Enter");
+                await page.waitForTimeout(200);
+                console.log(`Tag added: "${tag}"`);
+              }
+              await tagsInput.press('Tab');
+            }
+
+            // ── CATEGORY ───────────────────────────────────────────
+            if (meta.category) {
+              console.log(`Filling category: "${meta.category}"`);
+              
+              const categoryInput = page.locator('.react-select__input').nth(1);
+              
+              await categoryInput.waitFor({ state: "attached" });
+              await scrollToElement(categoryInput);
+              await categoryInput.click({ force: true });
+              
+              await categoryInput.fill(String(meta.category));
+              await page.waitForTimeout(500);
+
+              await categoryInput.press("Enter");
+              await categoryInput.press('Tab');
+              console.log(`Category selected: "${meta.category}"`);
+            }
+
+            // ── DESCRIPTION ────────────────────────────────────────
+            if (meta.description) {
+              console.log("Filling description");
+              const descInput = page.locator('textarea[data-hook="form-field-description-input"]').first();
+              await descInput.waitFor({ state: "visible" });
+              await scrollToElement(descInput);
+              await descInput.click();
+              
+              const desc = String(meta.description || "").slice(0, 200);
+              await descInput.fill(desc);
+              
+              await descInput.press('Tab');
+              await page.waitForTimeout(300);
+              console.log(`Description filled`);
+            }
+
+            // ── VIDEO AD RADIO BUTTON ──────────────────────────────
+            console.log("Scrolling to lock type section");
+
+            await page.waitForSelector(
+              'input[name="lockType"]',
+              { state: "attached", timeout: 15000 }
+            );
+
+            await page.evaluate(() => {
+              const wrappers = [...document.querySelectorAll('input[name="lockType"]')];
+              const videoAdRadio = wrappers.find(input => {
+                const container = input.closest('.sc-fHsOPI') || input.parentElement;
+                return container && container.textContent.includes("Video ad");
+              });
+
+              if (!videoAdRadio) throw new Error("Video ad radio button not found");
+
+              videoAdRadio.scrollIntoView({ block: "center" });
+              videoAdRadio.click();
+
+              videoAdRadio.dispatchEvent(new Event("change", { bubbles: true }));
+            });
+
+            await page.waitForTimeout(500);
+
+            const videoAdSelected = await page.evaluate(() => {
+              const wrappers = [...document.querySelectorAll('input[name="lockType"]')];
+              const videoAdRadio = wrappers.find(input => {
+                const container = input.closest('.sc-fHsOPI') || input.parentElement;
+                return container && container.textContent.includes("Video ad");
+              });
+              return videoAdRadio ? videoAdRadio.checked : false;
+            });
+
+            if (!videoAdSelected) {
+              console.log("Video ad not selected via JS click — trying Playwright locator");
+
+              const videoAdWrapper = page
+                .locator('.sc-fHsOPI')
+                .filter({ hasText: "Video ad" })
+                .first();
+
+              await scrollToElement(videoAdWrapper);
+              const radioInWrapper = videoAdWrapper.locator('input[type="radio"]').first();
+              await radioInWrapper.click({ force: true });
+              await page.waitForTimeout(400);
+            }
+
+            console.log("Video ad radio selected");
+
+            // ── PUBLISH BUTTON ────────────────────────────────────
+            console.log("Looking for Publish button");
+
+            const publishButton = page
+              .locator('button')
+              .filter({ hasText: /^Publish$/ })
+              .first();
+
+            await publishButton.waitFor({ state: "visible", timeout: 15000 });
+            await scrollToElement(publishButton);
+            await page.waitForTimeout(300);
+            await publishButton.click();
+
+            console.log("Clicked Publish");
+          }
+
+          async function verifyPublishStatus(page) {
+            console.log("Waiting 5 seconds before checking status...");
+            await page.waitForTimeout(5000);
+
+            let attempts = 0;
+            const maxAttempts = 50;
+
+            while (attempts < maxAttempts) {
+              attempts++;
+              console.log(`Reloading page to fetch latest server status (Attempt ${attempts}/${maxAttempts})...`);
+              
+              await page.reload({ waitUntil: "domcontentloaded" });
+              
+              try {
+                await page.waitForSelector('span[type="INFO"], span[type="SUCCESS"], span.sc-jtJlRs', { state: 'attached', timeout: 15000 });
+                await page.waitForTimeout(1000);
+              } catch (e) {
+                console.log("Warning: Badges didn't load in time after refresh. Network might be slow.");
+              }
+
+              const pending = page.locator('span').filter({ hasText: /^PENDING$/ }).first();
+              const published = page.locator('span').filter({ hasText: /^PUBLISHED$/ }).first();
+              const inReview = page.locator('span').filter({ hasText: /^IN REVIEW$/i }).first();
+              const rejected = page.locator('span').filter({ hasText: /^REJECTED$/i }).first();
+
+              if (await published.isVisible()) {
+                console.log("Status confirmed: PUBLISHED! Excellent. Stopping checks.");
+                return { removed: false, statusName: "PUBLISHED" };
+              }
+
+              if (await pending.isVisible() || await inReview.isVisible() || await rejected.isVisible()) {
+                let statusName = "PENDING";
+                if (await inReview.isVisible()) statusName = "IN REVIEW";
+                else if (await rejected.isVisible()) statusName = "REJECTED";
+
+                console.log(`Status is ${statusName}. Initiating removal process...`);
+
+                const ellipsisBtn = page.locator('button:has(svg[data-icon="ellipsis-h"])').first();
+                await scrollToElement(ellipsisBtn);
+                await ellipsisBtn.click();
+                console.log("Clicked ellipsis menu");
+                await page.waitForTimeout(1000);
+
+                const removeBtn = page.locator('button').filter({ hasText: /^Remove$/ }).first();
+                await removeBtn.waitFor({ state: "visible" });
+                await removeBtn.click();
+                console.log("Clicked Remove dropdown option");
+
+                const confirmBtn = page.locator('button[data-hook="z-modal-submit"]');
+                await confirmBtn.waitFor({ state: "visible" });
+                await confirmBtn.click();
+                console.log("Confirmed deletion on modal.");
+                
+                await page.waitForTimeout(2000);
+
+                // Return result instead of throwing — so the upload loop can still count this as an attempt
+                return { removed: true, statusName };
+              }
+
+              console.log("No recognizable status badge found yet. Could be loading or lost context...");
+              await page.waitForTimeout(20000);
+            }
+            
+            console.log("Warning: Status check timed out. Proceeding anyway.");
+            return { removed: false, statusName: "UNKNOWN" };
+          }
+
+          // ── Random Fingerprint Pool ────────────────────────────────
+          const FP_USER_AGENTS = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          ];
+          const FP_VIEWPORTS = [
+            { width: 1366, height: 768 },
+            { width: 1440, height: 900 },
+            { width: 1280, height: 800 },
+            { width: 1536, height: 864 },
+            { width: 1600, height: 900 },
+            { width: 1280, height: 720 },
+            { width: 1920, height: 1080 }
+          ];
+          const FP_GL_RENDERERS = [
+            "ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0)",
+            "ANGLE (Intel, Intel(R) HD Graphics 630 Direct3D11 vs_5_0 ps_5_0)",
+            "ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Ti Direct3D11 vs_5_0 ps_5_0)",
+            "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0)",
+            "ANGLE (AMD, AMD Radeon RX 570 Series Direct3D11 vs_5_0 ps_5_0)",
+            "ANGLE (Intel, Intel(R) Iris Xe Graphics Direct3D11 vs_5_0 ps_5_0)"
+          ];
+          const FP_VENDORS = ["Google Inc. (Intel)", "Google Inc. (NVIDIA)", "Google Inc. (AMD)", "Google Inc."];
+          const FP_HC     = [2, 4, 4, 6, 8, 8, 12, 16];
+          const FP_DM     = [2, 4, 4, 8, 8];
+          function fpRand(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+          // ─────────────────────────────────────────────────────────────
+
+          (async () => {
+            let browser = null;
+            let context = null;
+
+            // Profile count is set via the workflow "total_profiles" input (default: 3)
+            const TOTAL_PROFILES = parseInt(process.env.TOTAL_PROFILES || "3", 10);
+
+            try {
+              // 1. Check Limits & figure out how many uploads we can still do today
+              const ZEDGE_DAILY_LIMIT = 3;
+              const profileStateData = await getProfileState(TOTAL_PROFILES);
+              const remainingUploads = ZEDGE_DAILY_LIMIT - profileStateData.state.totalUploadsToday;
+              let currentProfileIndex = profileStateData.nextProfileIndex;
+              const perProfileLimit   = profileStateData.perProfileLimit;
+              let currentState = profileStateData.state;
+
+              console.log(`✅ Approved. Starting at profile index: ${currentProfileIndex}. Can do ${remainingUploads} upload(s) this run.`);
+
+              // 2. Pick random fingerprint for this session
+              const fpVP       = fpRand(FP_VIEWPORTS);
+              const fpUA       = fpRand(FP_USER_AGENTS);
+              const fpHC       = fpRand(FP_HC);
+              const fpDM       = fpRand(FP_DM);
+              const fpRenderer = fpRand(FP_GL_RENDERERS);
+              const fpVendor   = fpRand(FP_VENDORS);
+              const fpNoise    = Array.from({ length: 8 }, () => Math.floor(Math.random() * 3));
+              console.log(`🎭 Fingerprint: ${fpVP.width}x${fpVP.height} | HC:${fpHC} | DM:${fpDM}GB | UA:...${fpUA.slice(-50)}`);
+
+              // 2. Start Browser ONCE for the whole run
+              browser = await chromium.launch({
+                headless: isHeadless,
+                proxy,
+                args: [
+                  "--no-sandbox",
+                  "--disable-webrtc",
+                  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                  "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+                  "--disable-blink-features=AutomationControlled",
+                  "--disable-features=IsolateOrigins,site-per-process",
+                  "--disable-dev-shm-usage",
+                  "--no-first-run",
+                  "--no-default-browser-check",
+                  `--window-size=${fpVP.width},${fpVP.height}`
+                ]
+              });
+
+              const tz = await getProxyTimezone(browser);
+
+              context = await browser.newContext({
+                viewport:            fpVP,
+                locale:              "en-US",
+                timezoneId:          tz,
+                userAgent:           fpUA,
+                colorScheme:         "light",
+                ignoreHTTPSErrors:   true,
+                recordVideo: { dir: "videos/", size: fpVP }
+              });
+
+              context.setDefaultTimeout(0);
+              context.setDefaultNavigationTimeout(0);
+
+              await context.addInitScript((fp) => {
+                // Hide automation
+                Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+                delete navigator.__proto__.webdriver;
+
+                // Disable WebRTC
+                Object.defineProperty(window, "RTCPeerConnection",       { value: undefined });
+                Object.defineProperty(window, "webkitRTCPeerConnection", { value: undefined });
+                Object.defineProperty(navigator, "mediaDevices",         { value: undefined });
+
+                // Navigator fingerprint
+                Object.defineProperty(navigator, "hardwareConcurrency", { get: () => fp.hc });
+                Object.defineProperty(navigator, "deviceMemory",        { get: () => fp.dm });
+                Object.defineProperty(navigator, "platform",            { get: () => "Win32" });
+                Object.defineProperty(navigator, "languages",           { get: () => ["en-US", "en"] });
+                Object.defineProperty(navigator, "language",            { get: () => "en-US" });
+                Object.defineProperty(navigator, "vendor",              { get: () => "Google Inc." });
+                Object.defineProperty(navigator, "maxTouchPoints",      { get: () => 0 });
+
+                // Screen fingerprint
+                Object.defineProperty(screen, "width",       { get: () => fp.sw });
+                Object.defineProperty(screen, "height",      { get: () => fp.sh });
+                Object.defineProperty(screen, "availWidth",  { get: () => fp.sw });
+                Object.defineProperty(screen, "availHeight", { get: () => fp.sh - 40 });
+                Object.defineProperty(screen, "colorDepth",  { get: () => 24 });
+                Object.defineProperty(screen, "pixelDepth",  { get: () => 24 });
+
+                // Canvas noise — subtle ±1-2 pixel shift on readback
+                const _origGID = CanvasRenderingContext2D.prototype.getImageData;
+                CanvasRenderingContext2D.prototype.getImageData = function(sx, sy, sw, sh) {
+                  const id = _origGID.call(this, sx, sy, sw, sh);
+                  const n = fp.noise;
+                  for (let i = 0; i < id.data.length; i += 4) {
+                    id.data[i]   = Math.min(255, id.data[i]   + n[i % 8]);
+                    id.data[i+1] = Math.min(255, id.data[i+1] + n[(i+1) % 8]);
+                    id.data[i+2] = Math.min(255, id.data[i+2] + n[(i+2) % 8]);
+                  }
+                  return id;
+                };
+
+                // WebGL vendor + renderer spoof
+                const _origGP = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(param) {
+                  if (param === 37445) return fp.vendor;    // UNMASKED_VENDOR_WEBGL
+                  if (param === 37446) return fp.renderer;  // UNMASKED_RENDERER_WEBGL
+                  return _origGP.call(this, param);
+                };
+                const _origGP2 = WebGL2RenderingContext.prototype.getParameter;
+                WebGL2RenderingContext.prototype.getParameter = function(param) {
+                  if (param === 37445) return fp.vendor;
+                  if (param === 37446) return fp.renderer;
+                  return _origGP2.call(this, param);
+                };
+
+                // Plugins spoof (non-empty list looks more human)
+                Object.defineProperty(navigator, "plugins", {
+                  get: () => {
+                    const p = { length: 3, 0: { name: "Chrome PDF Plugin" }, 1: { name: "Chrome PDF Viewer" }, 2: { name: "Native Client" }, item: i => this[i], namedItem: n => null, refresh: () => {} };
+                    return p;
+                  }
+                });
+              }, {
+                hc:       fpHC,
+                dm:       fpDM,
+                sw:       fpVP.width,
+                sh:       fpVP.height,
+                noise:    fpNoise,
+                vendor:   fpVendor,
+                renderer: fpRenderer
+              });
+
+              const page = await context.newPage();
+
+              await page.setExtraHTTPHeaders({
+                "Accept-Language": "en-US,en;q=0.9"
+              });
+
+              // 3. BrowserLeaks check ONCE
+              console.log("Opening BrowserLeaks");
+              await page.goto("https://browserleaks.com/ip", { waitUntil: "domcontentloaded" });
+              await page.waitForLoadState("networkidle");
+              await scrollFullPage(page);
+              await page.evaluate(() => window.scrollTo(0, 0));
+
+              // 4. Login ONCE
+              console.log("Opening Zedge");
+              await page.goto("https://upload.zedge.net", { waitUntil: "domcontentloaded" });
+              await page.waitForLoadState("networkidle");
+              await page.waitForTimeout(2000);
+
+              // Screenshot to capture exactly what the page shows before login attempt
+              await page.screenshot({ path: "zedge-before-login.png", fullPage: true });
+              console.log(`Page URL before login: ${page.url()}`);
+              console.log(`Page title before login: ${await page.title()}`);
+
+              // Handle cookie consent modal (appears for certain proxy regions e.g. US/EU IPs)
+              try {
+                const acceptBtn = page.locator('button:has-text("Accept All Cookies")');
+                await acceptBtn.waitFor({ state: "visible", timeout: 5000 });
+                await acceptBtn.click();
+                console.log("Cookie consent accepted.");
+                await page.waitForTimeout(1500);
+              } catch {
+                console.log("No cookie consent modal — proceeding.");
+              }
+
+              await safeClick(
+                page.locator('[data-hook="za-login-email"]').first(),
+                "Continue with Email",
+                30000
+              );
+
+              await safeType(
+                page.locator('[data-hook="form-field-email-input"]'),
+                zedgeEmail,
+                "email"
+              );
+
+              await safeClick(
+                page.locator('button[data-hook="za-submit"]'),
+                "Continue"
+              );
+
+              await safeType(
+                page.locator('[data-hook="form-field-password-input"]'),
+                zedgePassword,
+                "password"
+              );
+
+              await safeClick(
+                page.locator('button[data-hook="za-submit"]'),
+                "Login"
+              );
+
+              console.log("Waiting for login success bell icon");
+              await page.locator('svg[data-icon="bell"]').waitFor({ state: "visible" });
+              await page.screenshot({ path: "zedge-after-login.png", fullPage: true });
+
+              // ─────────────────────────────────────────────────────────────
+              // 5. UPLOAD LOOP — repeat up to remainingUploads times
+              // ─────────────────────────────────────────────────────────────
+              let successCount = 0;
+
+              for (let i = 0; i < remainingUploads; i++) {
+                let queueItem = null;
+                const uploadNum = i + 1;
+
+                console.log(`\n========================================`);
+                console.log(`Upload ${uploadNum} of ${remainingUploads} | Profile Index: ${currentProfileIndex}`);
+                console.log(`========================================`);
+
+                try {
+                  // Fetch the next queued item
+                  queueItem = await getNextWallpaperFromRealtimeDB();
+                } catch (e) {
+                  console.log(`Queue is empty after ${successCount} upload(s). Stopping loop.`);
+                  break;
+                }
+
+                try {
+                  // Navigate back to Zedge portal for each upload
+                  console.log("Navigating to Zedge upload portal");
+                  await page.goto("https://upload.zedge.net", { waitUntil: "domcontentloaded" });
+                  await page.waitForLoadState("networkidle");
+
+                  // Click Profiles tab
+                  await safeClick(
+                    page.locator('a:has-text("Profiles")').first(),
+                    "Profiles"
+                  );
+
+                  // Click the correct rotated profile
+                  await safeClick(
+                    page.locator('[data-hook="profile-list"] > div').nth(currentProfileIndex),
+                    `Profile Index ${currentProfileIndex}`
+                  );
+
+                  // Wait for the profile page to fully render before touching anything.
+                  await page.waitForLoadState("networkidle");
+                  await page.waitForTimeout(1500);
+
+                  // Navigate directly to the correct content-type URL so we never need to
+                  // interact with the unreliable type-selection modal.
+                  // URL shape: .../profiles/<profileId>/content/WALLPAPER  (or AUDIO)
+                  const profilePageUrl = page.url();
+                  const profileBase    = profilePageUrl.replace(/\/content\/[^\/].*$/, "");
+                  const targetType     = queueItem.isMp3 ? "AUDIO" : "WALLPAPER";
+                  const targetContentUrl = `${profileBase}/content/${targetType}`;
+                  console.log(`Navigating directly to ${targetType} page: ${targetContentUrl}`);
+                  await page.goto(targetContentUrl, { waitUntil: "domcontentloaded" });
+                  await page.waitForLoadState("networkidle");
+                  await page.waitForTimeout(1000);
+
+                  // Click the Upload (+) button — now already on the right content-type page
+                  await safeClick(
+                    page.locator("svg.fa-plus").first(),
+                    "Upload plus icon"
+                  );
+
+                  // Wait for upload dialog to appear
+                  await page.waitForTimeout(800);
+                  await page.screenshot({ path: `zedge-upload-menu-${uploadNum}.png`, fullPage: false });
+
+                  // Upload the file
+                  await uploadWallpaperInDialog(page, queueItem.localFile);
+
+                  // Fill in meta (title, tags, category, description)
+                  await fillMetaDialog(page, {
+                    title:       queueItem.title,
+                    tags:        queueItem.tags,
+                    category:    queueItem.category,
+                    description: queueItem.description
+                  });
+
+                  // Check publish status — returns {removed, statusName} instead of throwing
+                  const publishResult = await verifyPublishStatus(page);
+
+                  await page.screenshot({ path: `zedge-final-${uploadNum}.png`, fullPage: true });
+
+                  // Always delete from Firebase queue and count the upload on the profile,
+                  // regardless of whether it was PUBLISHED or removed (PENDING/IN REVIEW/REJECTED).
+                  // Only a true technical error (catch block) skips this.
+                  await markWallpaperDoneAndDelete(queueItem.id, queueItem.name);
+                  await updateProfileStateAfterUpload(currentState, currentProfileIndex);
+
+                  // Advance local state for next iteration
+                  const profileUploadCounts = { ...(currentState.profileUploadCounts || {}) };
+                  profileUploadCounts[currentProfileIndex] = (profileUploadCounts[currentProfileIndex] || 0) + 1;
+                  currentState = {
+                    ...currentState,
+                    totalUploadsToday: currentState.totalUploadsToday + 1,
+                    lastUsedProfileIndex: currentProfileIndex,
+                    profileUploadCounts
+                  };
+
+                  successCount++;
+
+                  if (publishResult.removed) {
+                    console.log(`⚠️ Upload ${uploadNum} was removed from Zedge (Status: ${publishResult.statusName}). Counted as upload attempt. (${successCount} this run)`);
+                  } else {
+                    console.log(`✅ Upload ${uploadNum} complete! Status: ${publishResult.statusName}. (${successCount} this run)`);
+                  }
+
+                } catch (uploadErr) {
+                  console.error(`❌ Upload ${uploadNum} failed with a technical error: ${uploadErr.message}`);
+                  if (queueItem?.id) {
+                    await markWallpaperFailed(queueItem.id, uploadErr.message).catch(() => {});
+                  }
+                  // Take a failure screenshot and continue to next upload
+                  await page.screenshot({ path: `zedge-error-upload-${uploadNum}.png`, fullPage: true }).catch(() => {});
+                  console.log("Continuing to next upload despite error...");
+                }
+
+                // Advance to the next profile still under its per-profile limit.
+                // Successful uploads increment profileUploadCounts and will be skipped once at limit.
+                // Failed uploads do NOT increment the count so they may be retried on a future run.
+                currentProfileIndex = getNextAvailableProfile(currentProfileIndex, currentState.profileUploadCounts, TOTAL_PROFILES, perProfileLimit);
+                if (currentProfileIndex === -1) {
+                  console.log("All profiles have uploaded today. No further uploads this run.");
+                  break;
+                }
+
+                // Small pause between uploads to avoid looking like a bot
+                if (i < remainingUploads - 1) {
+                  console.log("Waiting 3 seconds before next upload...");
+                  await page.waitForTimeout(3000);
+                }
+              }
+
+              console.log(`\n🏁 Run complete. ${successCount} upload(s) succeeded.`);
+
+              await context.close();
+              await browser.close();
+
+            } catch (err) {
+              console.error("BOT FATAL ERROR:", err);
+              if (context) await context.close().catch(() => {});
+              if (browser) await browser.close().catch(() => {});
+              process.exit(1);
+            }
+          })();
+          '@ | Set-Content bot.js
+
+      - name: Run bot
+        shell: pwsh
+        env:
+          PROXY_SERVER: ${{ github.event.inputs.proxy_server }}
+          PROXY_USER: ${{ github.event.inputs.proxy_user }}
+          PROXY_PASS: ${{ github.event.inputs.proxy_pass }}
+          ZEDGE_EMAIL: ${{ github.event.inputs.zedge_email }}
+          ZEDGE_PASSWORD: ${{ github.event.inputs.zedge_password }}
+          HEADLESS: ${{ github.event.inputs.headless }}
+          TOTAL_PROFILES: ${{ github.event.inputs.total_profiles }}
+        run: node bot.js
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zedge-artifacts
+          path: |
+            zedge-before-login.png
+            zedge-after-login.png
+            zedge-upload-menu-*.png
+            zedge-after-type-click-*.png
+            zedge-dialog-error.png
+            zedge-error-upload-*.png
+            zedge-final-*.png
+            videos/
+            downloads/
