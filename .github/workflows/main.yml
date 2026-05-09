@@ -345,6 +345,25 @@ jobs:
             console.log(`Deleted from Firebase: ${pathName}`);
           }
 
+          async function sendFacebookNotification(message) {
+            const apikey = process.env.FB_APIKEY || "D4GOxmG9G2L6GFFK";
+            if (!apikey) {
+              console.log("Facebook notification API key not configured. Skipping.");
+              return;
+            }
+            try {
+              const url = `https://api.callmebot.com/facebook/send.php?apikey=${encodeURIComponent(apikey)}&text=${encodeURIComponent(message)}`;
+              const res = await fetch(url);
+              if (!res.ok) {
+                console.log(`Facebook API response failed: HTTP ${res.status}`);
+              } else {
+                console.log("Facebook notification successfully sent.");
+              }
+            } catch (err) {
+              console.log(`Error sending Facebook notification: ${err.message}`);
+            }
+          }
+
           // --- PROFILE ROTATION STATE MANAGER ---
 
           // Returns the next profile index whose upload count is still below perProfileLimit.
@@ -1397,11 +1416,16 @@ jobs:
 
                   successCount++;
 
+                  const folderLabel = process.env.FOLDER_NAME || "Zedge Bot";
+                  let notifyMsg = "";
                   if (publishResult.removed) {
+                    notifyMsg = `⚠️ [${folderLabel}] Zedge Upload Alert!\n\nFile: ${queueItem.name}\nTitle: ${queueItem.title || "N/A"}\nCategory: ${queueItem.category || "N/A"}\nStatus: ${publishResult.statusName}\nProfile Index: ${currentProfileIndex}\n\nNotice: This item has been auto-removed from Zedge.`;
                     console.log(`⚠️ Upload ${uploadNum} was removed from Zedge (Status: ${publishResult.statusName}). Counted as upload attempt. (${successCount} this run)`);
                   } else {
+                    notifyMsg = `🚀 [${folderLabel}] Zedge Upload Success!\n\nFile: ${queueItem.name}\nTitle: ${queueItem.title || "N/A"}\nCategory: ${queueItem.category || "N/A"}\nStatus: ${publishResult.statusName}\nProfile Index: ${currentProfileIndex}`;
                     console.log(`✅ Upload ${uploadNum} complete! Status: ${publishResult.statusName}. (${successCount} this run)`);
                   }
+                  await sendFacebookNotification(notifyMsg);
 
                 } catch (uploadErr) {
                   console.error(`❌ Upload ${uploadNum} failed with a technical error: ${uploadErr.message}`);
@@ -1454,6 +1478,8 @@ jobs:
           HEADLESS: ${{ github.event.inputs.headless }}
           TOTAL_PROFILES: ${{ github.event.inputs.total_profiles }}
           UA_GROUP: ${{ github.event.inputs.ua_group }}
+          FOLDER_NAME: "Zedge 3"
+          FB_APIKEY: ${{ secrets.FB_APIKEY }}
         run: node bot.js
 
       - name: Upload artifacts
