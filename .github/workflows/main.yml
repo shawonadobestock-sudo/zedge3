@@ -26,10 +26,32 @@ on:
         description: "Number of Zedge profiles to rotate through (e.g. 1, 2, 3, 6)"
         required: false
         default: "3"
+      os:
+        description: "🖥️ Runner OS"
+        required: true
+        default: "windows-2025"
+        type: choice
+        options:
+          - windows-2025
+          - windows-2022
+          - windows-latest
+      ua_group:
+        description: "🌐 Browser / User-Agent type"
+        required: true
+        default: "random"
+        type: choice
+        options:
+          - random
+          - chrome_windows
+          - edge_windows
+          - firefox
+          - chrome_macos
+          - safari_macos
+          - android_mobile
 
 jobs:
   automation:
-    runs-on: windows-latest
+    runs-on: ${{ inputs.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +66,227 @@ jobs:
           npm init -y
           npm install playwright
           npx playwright install chromium
+
+      - name: 🎲 Randomize Machine Identity
+        shell: pwsh
+        run: |
+          Write-Host "============================================================"
+          Write-Host "  🎲  RANDOMIZING MACHINE IDENTITY"
+          Write-Host "============================================================"
+
+          # ── 1. Randomize Machine GUID (Windows Registry) ──────────────
+          Write-Host ""
+          Write-Host "── Machine GUID ─────────────────────────────────────────────"
+          try {
+            $oldGuid = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid).MachineGuid
+            Write-Host "Old GUID : $oldGuid"
+            $newGuid = [System.Guid]::NewGuid().ToString()
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name 'MachineGuid' -Value $newGuid
+            $verify = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid).MachineGuid
+            Write-Host "New GUID : $verify"
+            Write-Host "✅ Machine GUID randomized successfully"
+          } catch {
+            Write-Host "⚠️ Machine GUID change failed: $($_.Exception.Message)"
+          }
+
+          # ── 2. Randomize MachineId in SQM (telemetry GUID) ───────────
+          Write-Host ""
+          Write-Host "── SQM / Telemetry GUID ─────────────────────────────────────"
+          try {
+            $sqmPath = 'HKLM:\SOFTWARE\Microsoft\SQMClient'
+            if (Test-Path $sqmPath) {
+              $newSqm = [System.Guid]::NewGuid().ToString().ToUpper()
+              $newSqm = "{$newSqm}"
+              Set-ItemProperty -Path $sqmPath -Name 'MachineId' -Value $newSqm -ErrorAction SilentlyContinue
+              Write-Host "✅ SQM MachineId set to: $newSqm"
+            } else {
+              Write-Host "ℹ️ SQM registry key not present — skipping"
+            }
+          } catch {
+            Write-Host "⚠️ SQM GUID change failed: $($_.Exception.Message)"
+          }
+
+          # ── 3. Randomize MAC addresses on physical adapters ───────────
+          Write-Host ""
+          Write-Host "── MAC Address Randomization ────────────────────────────────"
+          # NOTE: We write to registry only — NO Disable/Enable adapter.
+          # Disabling the adapter would cut the runner's own GitHub connection (hangs).
+          # The registry value persists and takes effect on next adapter cycle.
+          # Websites cannot read MAC addresses via JavaScript so this is sufficient.
+          $regBase = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4D36E972-E325-11CE-BFC1-08002BE10318}"
+          $adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Status -ne "Not Present" }
+
+          if ($adapters) {
+            foreach ($adapter in $adapters) {
+              try {
+                # Generate locally-administered unicast MAC
+                $bytes = 1..6 | ForEach-Object { Get-Random -Minimum 0 -Maximum 255 }
+                $bytes[0] = ($bytes[0] -band 0xFE) -bor 0x02  # unicast + locally administered
+                $macReg     = ($bytes | ForEach-Object { '{0:X2}' -f $_ }) -join ''
+                $macDisplay = ($bytes | ForEach-Object { '{0:X2}' -f $_ }) -join '-'
+
+                # Find registry subkey for this adapter by matching InterfaceGuid
+                $keys = Get-ChildItem $regBase -ErrorAction SilentlyContinue
+                $found = $false
+                foreach ($key in $keys) {
+                  $props = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+                  if ($props.NetCfgInstanceId -and $props.NetCfgInstanceId -eq $adapter.InterfaceGuid) {
+                    # Write registry only — no disable/enable to avoid hanging
+                    Set-ItemProperty -Path $key.PSPath -Name 'NetworkAddress' -Value $macReg -ErrorAction Stop
+                    Write-Host "✅ $($adapter.Name): MAC registry → $macDisplay (active on next cycle)"
+                    $found = $true
+                    break
+                  }
+                }
+                if (-not $found) {
+                  # Fallback: try writing via netsh (no disconnect risk)
+                  Write-Host "ℹ️ Registry key not found for $($adapter.Name) — trying netsh"
+                  $netshMac = $macDisplay.Replace('-', '')
+                  netsh interface set interface "$($adapter.Name)" newmac="$netshMac" 2>$null
+                  Write-Host "✅ $($adapter.Name): netsh MAC set → $macDisplay"
+                }
+              } catch {
+                Write-Host "⚠️ MAC update skipped for $($adapter.Name): $($_.Exception.Message)"
+              }
+            }
+          } else {
+            Write-Host "ℹ️ No physical adapters found — skipping"
+          }
+
+
+          Write-Host ""
+          Write-Host "============================================================"
+          Write-Host "  ✅  Machine Identity Randomization Complete"
+          Write-Host "============================================================"
+
+      - name: Collect Device Info
+        shell: pwsh
+        run: |
+          Write-Host "============================================================"
+          Write-Host "  🖥️  GITHUB ACTIONS RUNNER — DEVICE INFORMATION REPORT"
+          Write-Host "============================================================"
+
+          # ── OS & Runner ──────────────────────────────────────────────
+          Write-Host ""
+          Write-Host "── OS & Runner ──────────────────────────────────────────────"
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "OS Name        : $($os.Caption)"
+          Write-Host "OS Version     : $($os.Version)"
+          Write-Host "Build Number   : $($os.BuildNumber)"
+          Write-Host "Architecture   : $($os.OSArchitecture)"
+          Write-Host "System Drive   : $($os.SystemDrive)"
+          Write-Host "Install Date   : $($os.InstallDate)"
+          Write-Host "Last Boot      : $($os.LastBootUpTime)"
+          Write-Host "Runner Image   : $env:ImageOS / $env:ImageVersion"
+          Write-Host "GitHub Runner  : $env:RUNNER_NAME ($env:RUNNER_OS)"
+          Write-Host "Runner Arch    : $env:RUNNER_ARCH"
+          Write-Host "Runner Temp    : $env:RUNNER_TEMP"
+          Write-Host "Runner Tool    : $env:RUNNER_TOOL_CACHE"
+          Write-Host "GitHub Region  : $env:GITHUB_SERVER_URL"
+          Write-Host "Workflow       : $env:GITHUB_WORKFLOW"
+          Write-Host "Run ID         : $env:GITHUB_RUN_ID"
+          Write-Host "Run Number     : $env:GITHUB_RUN_NUMBER"
+          Write-Host "Job            : $env:GITHUB_JOB"
+          Write-Host "Actor          : $env:GITHUB_ACTOR"
+
+          # ── Machine / Computer Identity ───────────────────────────────
+          Write-Host ""
+          Write-Host "── Machine Identity ─────────────────────────────────────────"
+          $cs = Get-CimInstance Win32_ComputerSystem
+          Write-Host "Computer Name  : $($cs.Name)"
+          Write-Host "Domain / WG    : $($cs.Domain)"
+          Write-Host "Manufacturer   : $($cs.Manufacturer)"
+          Write-Host "Model          : $($cs.Model)"
+          Write-Host "System Type    : $($cs.SystemType)"
+          Write-Host "Total RAM (GB) : $([math]::Round($cs.TotalPhysicalMemory / 1GB, 2))"
+
+          # Machine GUID / Machine ID (Windows Registry)
+          try {
+            $machineGuid = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid
+            Write-Host "Machine GUID   : $machineGuid"
+          } catch {
+            Write-Host "Machine GUID   : (unavailable)"
+          }
+
+          # BIOS / Motherboard Serial
+          $bios = Get-CimInstance Win32_BIOS
+          Write-Host "BIOS Vendor    : $($bios.Manufacturer)"
+          Write-Host "BIOS Version   : $($bios.SMBIOSBIOSVersion)"
+          Write-Host "BIOS Serial    : $($bios.SerialNumber)"
+          Write-Host "BIOS Release   : $($bios.ReleaseDate)"
+
+          $board = Get-CimInstance Win32_BaseBoard
+          Write-Host "Motherboard    : $($board.Manufacturer) — $($board.Product)"
+          Write-Host "Board Serial   : $($board.SerialNumber)"
+
+          # ── CPU ───────────────────────────────────────────────────────
+          Write-Host ""
+          Write-Host "── CPU ──────────────────────────────────────────────────────"
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          Write-Host "CPU Name       : $($cpu.Name)"
+          Write-Host "CPU Cores      : $($cpu.NumberOfCores)"
+          Write-Host "Logical CPUs   : $($cpu.NumberOfLogicalProcessors)"
+          Write-Host "Max Clock(MHz) : $($cpu.MaxClockSpeed)"
+          Write-Host "CPU ID         : $($cpu.ProcessorId)"
+          Write-Host "CPU Socket     : $($cpu.SocketDesignation)"
+          Write-Host "CPU Arch       : $($cpu.Architecture)"
+
+          # ── RAM Slots ─────────────────────────────────────────────────
+          Write-Host ""
+          Write-Host "── RAM ──────────────────────────────────────────────────────"
+          Get-CimInstance Win32_PhysicalMemory | ForEach-Object {
+            Write-Host ("  Slot {0,-6}: {1} GB  {2} MHz  SN={3}" -f $_.DeviceLocator, [math]::Round($_.Capacity/1GB,1), $_.Speed, $_.SerialNumber)
+          }
+
+          # ── Network / MAC Addresses ───────────────────────────────────
+          Write-Host ""
+          Write-Host "── Network Adapters & MAC Addresses ─────────────────────────"
+          Get-CimInstance Win32_NetworkAdapterConfiguration |
+            Where-Object { $_.MACAddress -ne $null } |
+            ForEach-Object {
+              Write-Host ("  [{0}] MAC={1}  IP={2}  DHCP={3}" -f $_.Description, $_.MACAddress, ($_.IPAddress -join ', '), $_.DHCPEnabled)
+            }
+
+          # Quick public-IP lookup
+          Write-Host ""
+          Write-Host "── Public IP (via ipinfo.io) ─────────────────────────────────"
+          try {
+            $ipInfo = Invoke-RestMethod -Uri "https://ipinfo.io/json" -TimeoutSec 10
+            Write-Host "Public IP      : $($ipInfo.ip)"
+            Write-Host "ISP / Org      : $($ipInfo.org)"
+            Write-Host "City / Region  : $($ipInfo.city), $($ipInfo.region)"
+            Write-Host "Country        : $($ipInfo.country)"
+            Write-Host "Timezone       : $($ipInfo.timezone)"
+          } catch {
+            Write-Host "Public IP      : (lookup failed)"
+          }
+
+          # ── Disk ──────────────────────────────────────────────────────
+          Write-Host ""
+          Write-Host "── Disk Drives ──────────────────────────────────────────────"
+          Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+            $used = if ($_.Used) { [math]::Round($_.Used/1GB, 2) } else { "N/A" }
+            $free = if ($_.Free) { [math]::Round($_.Free/1GB, 2) } else { "N/A" }
+            Write-Host ("  Drive {0}: Used={1} GB  Free={2} GB" -f $_.Name, $used, $free)
+          }
+
+          # Physical disks
+          Get-CimInstance Win32_DiskDrive | ForEach-Object {
+            Write-Host ("  Physical: {0}  Size={1} GB  Serial={2}  Interface={3}" -f $_.Model, [math]::Round($_.Size/1GB,1), $_.SerialNumber, $_.InterfaceType)
+          }
+
+          # ── Environment Summary ───────────────────────────────────────
+          Write-Host ""
+          Write-Host "── Node / NPM / Tools ───────────────────────────────────────"
+          node --version
+          npm --version
+          Write-Host "PowerShell Ver : $($PSVersionTable.PSVersion)"
+
+          Write-Host ""
+          Write-Host "============================================================"
+          Write-Host "  ✅  Device Info Collection Complete"
+          Write-Host "============================================================"
 
       - name: Create bot.js
         shell: pwsh
@@ -666,14 +909,113 @@ jobs:
 
           // ── Random Fingerprint Pool ────────────────────────────────
           const FP_USER_AGENTS = [
+            // ── Chrome on Windows ──────────────────────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            // ── Microsoft Edge on Windows ──────────────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.3124.51",
+            // ── Chrome on macOS ────────────────────────────────────────
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            // ── Firefox on Windows ─────────────────────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            // ── Chrome on Linux ────────────────────────────────────────
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            // ── Chrome on Windows (extra) ─────────────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            // ── Edge extra ────────────────────────────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+            // ── Chrome on macOS extra ─────────────────────────────────
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            // ── Safari on macOS ───────────────────────────────────────
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Safari/605.1.15",
+            // ── Firefox extra ─────────────────────────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:136.0) Gecko/20100101 Firefox/136.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0",
+            // ── Opera / Brave ─────────────────────────────────────────
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 OPR/118.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 OPR/115.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 OPR/110.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Brave/135",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Brave/130",
+            // ── Android Chrome ────────────────────────────────────────
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.6478.122 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.135 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.86 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 14; SM-A546E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.127 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 12; Redmi Note 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/27.0 Chrome/130.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 13; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/25.0 Chrome/121.0.0.0 Mobile Safari/537.36",
+            // ── Linux extra ───────────────────────────────────────────
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
+            "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
           ];
           const FP_VIEWPORTS = [
             { width: 1366, height: 768 },
@@ -716,9 +1058,22 @@ jobs:
 
               console.log(`✅ Approved. Starting at profile index: ${currentProfileIndex}. Can do ${remainingUploads} upload(s) this run.`);
 
-              // 2. Pick random fingerprint for this session
+              // 2. Filter UA pool by selected group then pick random fingerprint
+              const UA_GROUP_SEL = (process.env.UA_GROUP || "random").toLowerCase();
+              const UA_GROUPS_MAP = {
+                chrome_windows: FP_USER_AGENTS.filter(u => u.includes("Windows") && u.includes("Chrome") && !u.includes("Edg/") && !u.includes("OPR/") && !u.includes("Brave") && !u.includes("Firefox")),
+                edge_windows:   FP_USER_AGENTS.filter(u => u.includes("Edg/")),
+                firefox:        FP_USER_AGENTS.filter(u => u.includes("Firefox")),
+                chrome_macos:   FP_USER_AGENTS.filter(u => u.includes("Macintosh") && u.includes("Chrome") && !u.includes("Version/")),
+                safari_macos:   FP_USER_AGENTS.filter(u => u.includes("Version/") && u.includes("Safari/605")),
+                android_mobile: FP_USER_AGENTS.filter(u => u.includes("Android"))
+              };
+              const fpUAPool = (UA_GROUPS_MAP[UA_GROUP_SEL] && UA_GROUPS_MAP[UA_GROUP_SEL].length > 0)
+                ? UA_GROUPS_MAP[UA_GROUP_SEL]
+                : FP_USER_AGENTS;
+              console.log(`🌐 UA Group: "${UA_GROUP_SEL}" → pool size: ${fpUAPool.length}`);
               const fpVP       = fpRand(FP_VIEWPORTS);
-              const fpUA       = fpRand(FP_USER_AGENTS);
+              const fpUA       = fpRand(fpUAPool);
               const fpHC       = fpRand(FP_HC);
               const fpDM       = fpRand(FP_DM);
               const fpRenderer = fpRand(FP_GL_RENDERERS);
@@ -820,6 +1175,52 @@ jobs:
                     return p;
                   }
                 });
+
+                // ── Font Fingerprint Noise ─────────────────────────────
+                // Intercept measureText so font-probing scripts get
+                // slightly randomised metrics instead of the real ones.
+                const _origMT = CanvasRenderingContext2D.prototype.measureText;
+                CanvasRenderingContext2D.prototype.measureText = function(text) {
+                  const metrics = _origMT.call(this, text);
+                  const noise = fp.noise[text.length % 8] * 0.05;
+                  Object.defineProperty(metrics, "width", {
+                    get: () => metrics.width + noise
+                  });
+                  return metrics;
+                };
+
+                // Block common font-detection APIs used by fingerprinters
+                const _origFF = document.fonts ? document.fonts.check.bind(document.fonts) : null;
+                if (_origFF && document.fonts) {
+                  document.fonts.check = function(font, text) {
+                    // Always return true — prevents font enumeration
+                    return true;
+                  };
+                }
+
+                // ── Audio Fingerprint Noise ────────────────────────────
+                // Add imperceptible noise to AudioBuffer to break audio FP
+                const _origCC = AudioBuffer.prototype.getChannelData;
+                AudioBuffer.prototype.getChannelData = function(channel) {
+                  const data = _origCC.call(this, channel);
+                  const seed = fp.noise[channel % 8];
+                  for (let i = 0; i < data.length; i += 100) {
+                    data[i] += seed * 0.0000001;
+                  }
+                  return data;
+                };
+
+                // Also spoof AnalyserNode float data
+                if (typeof AnalyserNode !== "undefined") {
+                  const _origGA = AnalyserNode.prototype.getFloatFrequencyData;
+                  AnalyserNode.prototype.getFloatFrequencyData = function(arr) {
+                    _origGA.call(this, arr);
+                    const seed = fp.noise[0] * 0.001;
+                    for (let i = 0; i < arr.length; i++) {
+                      arr[i] += seed;
+                    }
+                  };
+                }
               }, {
                 hc:       fpHC,
                 dm:       fpDM,
@@ -1052,6 +1453,7 @@ jobs:
           ZEDGE_PASSWORD: ${{ github.event.inputs.zedge_password }}
           HEADLESS: ${{ github.event.inputs.headless }}
           TOTAL_PROFILES: ${{ github.event.inputs.total_profiles }}
+          UA_GROUP: ${{ github.event.inputs.ua_group }}
         run: node bot.js
 
       - name: Upload artifacts
