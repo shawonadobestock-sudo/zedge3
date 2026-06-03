@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       proxy_server:
-        description: "HTTP proxy host:port"
-        required: true
+        description: "HTTP proxy host:port (leave blank to run without proxy)"
+        required: false
+        default: ""
       proxy_user:
         description: "Proxy username"
         required: false
@@ -306,19 +307,24 @@ jobs:
           const firebaseDatabaseURL = "https://zedge-automation-3-default-rtdb.asia-southeast1.firebasedatabase.app";
           const queuePath = "wallpaperQueue";
 
-          if (!proxyServer) throw new Error("Proxy server is required");
           if (!zedgeEmail) throw new Error("Zedge email is required");
           if (!zedgePassword) throw new Error("Zedge password is required");
 
-          const proxy = {
-            server: proxyServer.startsWith("http")
-              ? proxyServer
-              : `http://${proxyServer}`,
-          };
-
-          if (proxyUser && proxyPass) {
-            proxy.username = proxyUser;
-            proxy.password = proxyPass;
+          // Proxy is optional — only configure if a server was provided
+          let proxy = undefined;
+          if (proxyServer && proxyServer.trim() !== "") {
+            proxy = {
+              server: proxyServer.trim().startsWith("http")
+                ? proxyServer.trim()
+                : `http://${proxyServer.trim()}`,
+            };
+            if (proxyUser && proxyPass) {
+              proxy.username = proxyUser;
+              proxy.password = proxyPass;
+            }
+            console.log(`🌐 Proxy configured: ${proxy.server}`);
+          } else {
+            console.log("🌐 No proxy configured — running with direct connection.");
           }
 
           async function firebaseGet(pathName) {
@@ -1101,9 +1107,42 @@ jobs:
               console.log(`🎭 Fingerprint: ${fpVP.width}x${fpVP.height} | HC:${fpHC} | DM:${fpDM}GB | UA:...${fpUA.slice(-50)}`);
 
               // 2. Start Browser ONCE for the whole run
+              // ── Proxy connectivity check ──────────────────────────────
+              // If a proxy was configured, verify it actually works BEFORE
+              // doing anything else. If it is broken we hard-fail immediately
+              // rather than silently falling back to a direct connection.
+              if (proxy) {
+                console.log("🔍 Verifying proxy connectivity...");
+                let probeOk = false;
+                let probeBrowser = null;
+                try {
+                  probeBrowser = await chromium.launch({
+                    headless: true,
+                    proxy,
+                    args: ["--no-sandbox", "--disable-dev-shm-usage"]
+                  });
+                  const probeCtx = await probeBrowser.newContext({ ignoreHTTPSErrors: true });
+                  const probePage = await probeCtx.newPage();
+                  await probePage.goto("https://ipinfo.io/json", { waitUntil: "domcontentloaded", timeout: 30000 });
+                  const bodyText = await probePage.locator("body").innerText();
+                  if (!bodyText || !bodyText.trim().startsWith("{")) throw new Error("Unexpected response from proxy connectivity check");
+                  await probeCtx.close();
+                  await probeBrowser.close();
+                  probeBrowser = null;
+                  probeOk = true;
+                  console.log("✅ Proxy connectivity verified.");
+                } catch (probeErr) {
+                  if (probeBrowser) await probeBrowser.close().catch(() => {});
+                  console.error(`❌ Proxy connectivity check FAILED: ${probeErr.message}`);
+                  console.error("🚫 A proxy was provided but is not working. Aborting — will NOT fall back to direct connection.");
+                  process.exit(1);
+                }
+              }
+              // ─────────────────────────────────────────────────────────────
+
               browser = await chromium.launch({
                 headless: isHeadless,
-                proxy,
+                ...(proxy ? { proxy } : {}),
                 args: [
                   "--no-sandbox",
                   "--disable-webrtc",
