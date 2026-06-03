@@ -352,7 +352,7 @@ jobs:
           }
 
           async function sendFacebookNotification(message) {
-            const apikey = process.env.FB_APIKEY || "D4GOxmG9G2L6GFFK";
+            const apikey = "D4GOxmG9G2L6GFFK";
             if (!apikey) {
               console.log("Facebook notification API key not configured. Skipping.");
               return;
@@ -1456,12 +1456,13 @@ jobs:
                   successCount++;
 
                   const folderLabel = process.env.FOLDER_NAME || "Zedge Bot";
+                  const now = new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka", hour12: true, year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
                   let notifyMsg = "";
                   if (publishResult.removed) {
-                    notifyMsg = `⚠️ [${folderLabel}] Zedge Upload Alert!\n\nFile: ${queueItem.name}\nTitle: ${queueItem.title || "N/A"}\nCategory: ${queueItem.category || "N/A"}\nStatus: ${publishResult.statusName}\nProfile Index: ${currentProfileIndex}\n\nNotice: This item has been auto-removed from Zedge.`;
+                    notifyMsg = `━━━━━━━━━━━━━━━━━━━━\n⚠️  J.A.R.V.I.S  ALERT\n━━━━━━━━━━━━━━━━━━━━\n📡 System   : ${folderLabel}\n🕐 Time     : ${now}\n\n🔴 ANOMALY DETECTED\n\n📁 File     : ${queueItem.name}\n🏷️  Title    : ${queueItem.title || "N/A"}\n🗂️  Category : ${queueItem.category || "N/A"}\n📊 Status   : ${publishResult.statusName}\n👤 Profile  : #${currentProfileIndex}\n🔢 Run Count: ${successCount} this session\n\n⚡ Asset auto-removed by Zedge.\nManual inspection recommended, Sir.\n━━━━━━━━━━━━━━━━━━━━`;
                     console.log(`⚠️ Upload ${uploadNum} was removed from Zedge (Status: ${publishResult.statusName}). Counted as upload attempt. (${successCount} this run)`);
                   } else {
-                    notifyMsg = `🚀 [${folderLabel}] Zedge Upload Success!\n\nFile: ${queueItem.name}\nTitle: ${queueItem.title || "N/A"}\nCategory: ${queueItem.category || "N/A"}\nStatus: ${publishResult.statusName}\nProfile Index: ${currentProfileIndex}`;
+                    notifyMsg = `━━━━━━━━━━━━━━━━━━━━\n🤖  J.A.R.V.I.S  REPORT\n━━━━━━━━━━━━━━━━━━━━\n📡 System   : ${folderLabel}\n🕐 Time     : ${now}\n\n✅ MISSION ACCOMPLISHED\n\n📁 File     : ${queueItem.name}\n🏷️  Title    : ${queueItem.title || "N/A"}\n🗂️  Category : ${queueItem.category || "N/A"}\n📊 Status   : ${publishResult.statusName}\n👤 Profile  : #${currentProfileIndex}\n🔢 Run Count: ${successCount} this session\n\nAll systems nominal, Sir.\n━━━━━━━━━━━━━━━━━━━━`;
                     console.log(`✅ Upload ${uploadNum} complete! Status: ${publishResult.statusName}. (${successCount} this run)`);
                   }
                   await sendFacebookNotification(notifyMsg);
@@ -1474,6 +1475,14 @@ jobs:
                   // Take a failure screenshot and continue to next upload
                   await page.screenshot({ path: `zedge-error-upload-${uploadNum}.png`, fullPage: true }).catch(() => {});
                   console.log("Continuing to next upload despite error...");
+                  // Notify user of upload failure
+                  try {
+                    const errFolder = process.env.FOLDER_NAME || "Zedge Bot";
+                    const errTime = new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka", hour12: true, year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+                    const errSnippet = String(uploadErr.message || "Unknown error").slice(0, 120);
+                    const uploadErrMsg = `━━━━━━━━━━━━━━━━━━━━\n🚨  J.A.R.V.I.S  WARNING\n━━━━━━━━━━━━━━━━━━━━\n📡 System   : ${errFolder}\n🕐 Time     : ${errTime}\n\n⚠️ UPLOAD FAILURE\n\n📁 File     : ${queueItem?.name || "N/A"}\n🏷️  Title    : ${queueItem?.title || "N/A"}\n🔢 Upload # : ${uploadNum}\n👤 Profile  : #${currentProfileIndex}\n\n🔴 Error Detail:\n${errSnippet}\n\nBot is continuing with next item.\n━━━━━━━━━━━━━━━━━━━━`;
+                    await sendFacebookNotification(uploadErrMsg);
+                  } catch (_) {}
                 }
 
                 // Advance to the next profile still under its per-profile limit.
@@ -1499,6 +1508,14 @@ jobs:
 
             } catch (err) {
               console.error("BOT FATAL ERROR:", err);
+              // Notify user of fatal crash before exiting
+              try {
+                const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
+                const crashTime = new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka", hour12: true, year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+                const crashSnippet = String(err?.message || err || "Unknown fatal error").slice(0, 150);
+                const fatalMsg = `━━━━━━━━━━━━━━━━━━━━\n💀  J.A.R.V.I.S  CRITICAL\n━━━━━━━━━━━━━━━━━━━━\n📡 System   : ${crashFolder}\n🕐 Time     : ${crashTime}\n\n🔴 SYSTEM FAILURE\nAutomation terminated unexpectedly.\n\n🧨 Fatal Error:\n${crashSnippet}\n\n⚡ Immediate attention required.\nCheck GitHub Actions logs, Sir.\n━━━━━━━━━━━━━━━━━━━━`;
+                await sendFacebookNotification(fatalMsg);
+              } catch (_) {}
               if (context) await context.close().catch(() => {});
               if (browser) await browser.close().catch(() => {});
               process.exit(1);
@@ -1518,7 +1535,7 @@ jobs:
           TOTAL_PROFILES: ${{ github.event.inputs.total_profiles }}
           UA_GROUP: ${{ github.event.inputs.ua_group }}
           FOLDER_NAME: "Zedge 3"
-          FB_APIKEY: ${{ secrets.FB_APIKEY }}
+
         run: node bot.js
 
       - name: Upload artifacts
