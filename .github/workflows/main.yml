@@ -415,12 +415,22 @@ jobs:
 
             if (state.lastUploadDate !== today) {
               console.log("New day detected! Resetting daily upload count and profile usage.");
+              // ── Alternate upload type each new day: AUDIO (ringtone) ↔ WALLPAPER (image) ──
+              const prevType = state.uploadDayType || "WALLPAPER"; // if no record yet, flip so Day 1 = AUDIO
+              state.uploadDayType = (prevType === "AUDIO") ? "WALLPAPER" : "AUDIO";
+              console.log(`📅 Day changed — today's upload type: ${state.uploadDayType} (${state.uploadDayType === "AUDIO" ? "🎵 Ringtone" : "🖼️ Wallpaper"} day)`);
               state.lastUploadDate = today;
               state.totalUploadsToday = 0;
               state.profileUploadCounts = {};
               // lastUsedProfileIndex is intentionally NOT reset here so the rotation
               // continues from where it left off across days.
               // e.g. 6 profiles, limit 3/day: Day1→0,1,2  Day2→3,4,5  Day3→0,1,2 ...
+            }
+
+            // Ensure uploadDayType is always initialized (very first run ever)
+            if (!state.uploadDayType) {
+              state.uploadDayType = "AUDIO"; // First day defaults to ringtone
+              console.log("📅 First-ever run — defaulting to AUDIO (🎵 Ringtone) day");
             }
 
             const ZEDGE_DAILY_LIMIT = 3; // Zedge max uploads per day
@@ -459,28 +469,37 @@ jobs:
               totalUploadsToday: state.totalUploadsToday + 1,
               lastUsedProfileIndex: usedProfileIndex,
               totalProfilesAvailable: state.totalProfilesAvailable,
-              profileUploadCounts
+              profileUploadCounts,
+              uploadDayType: state.uploadDayType
             });
           }
           // ----------------------------------------
 
-          async function getNextWallpaperFromRealtimeDB() {
-            console.log("Checking Firebase Realtime Database queue...");
+          async function getNextWallpaperFromRealtimeDB(dayType) {
+            console.log(`Checking Firebase Realtime Database queue... (Today's type: ${dayType})`);
             const data = await firebaseGet(queuePath);
             if (!data) throw new Error("No items found in Realtime Database");
 
             const entries = Object.entries(data)
-              .filter(([id, item]) => item && item.status === "queued" && (item.fileBase64 || item.imageBase64))
+              .filter(([id, item]) => {
+                if (!item || item.status !== "queued") return false;
+                if (!(item.fileBase64 || item.imageBase64)) return false;
+                const itemIsMp3 = item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3"));
+                if (dayType === "AUDIO")     return itemIsMp3;   // 🎵 Ringtone day — MP3 only
+                if (dayType === "WALLPAPER") return !itemIsMp3;  // 🖼️ Wallpaper day — images only
+                return true; // fallback: no type filter
+              })
               .sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
 
-            if (!entries.length) throw new Error("No queued item found");
+            if (!entries.length) throw new Error(`No queued ${dayType} item found — queue may be empty for today's upload type`);
 
             const [id, item] = entries[0];
             const localDir = path.join(process.cwd(), "downloads");
             fs.mkdirSync(localDir, { recursive: true });
             
             const isMp3 = item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3"));
-            const ext = isMp3 ? ".mp3" : ".jpg";
+            const isJpeg = item.name && item.name.toLowerCase().endsWith(".jpeg");
+            const ext = isMp3 ? ".mp3" : (isJpeg ? ".jpeg" : ".jpg");
             const localFile = path.join(localDir, `${id}${ext}`);
 
             console.log(`Saving queued item: ${item.name || id} as ${ext}`);
@@ -1083,6 +1102,10 @@ jobs:
 
               console.log(`✅ Approved. Starting at profile index: ${currentProfileIndex}. Can do ${remainingUploads} upload(s) this run.`);
 
+              // ── Read today's upload type from Firebase state ──────────────────────────────
+              const dayType = profileStateData.state.uploadDayType || "AUDIO";
+              console.log(`📅 Today's upload type: ${dayType === "AUDIO" ? "🎵 AUDIO (Ringtone)" : "🖼️ WALLPAPER (Image)"} day`);
+
               // 2. Filter UA pool by selected group then pick random fingerprint
               const UA_GROUP_SEL = (process.env.UA_GROUP || "random").toLowerCase();
               const UA_GROUPS_MAP = {
@@ -1371,7 +1394,7 @@ jobs:
 
                 try {
                   // Fetch the next queued item
-                  queueItem = await getNextWallpaperFromRealtimeDB();
+                  queueItem = await getNextWallpaperFromRealtimeDB(dayType);
                 } catch (e) {
                   console.log(`Queue is empty after ${successCount} upload(s). Stopping loop.`);
                   break;
