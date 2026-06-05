@@ -480,6 +480,12 @@ jobs:
             const data = await firebaseGet(queuePath);
             if (!data) throw new Error("No items found in Realtime Database");
 
+            // Full queue diagnostics (professional observability)
+            const allQueued = Object.entries(data).filter(([_, item]) => item && item.status === "queued");
+            const queuedAudios = allQueued.filter(([_, item]) => item && (item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3"))));
+            const queuedImages = allQueued.filter(([_, item]) => item && !(item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3"))));
+            console.log(`📊 Queue diagnostics | totalQueued=${allQueued.length} | images=${queuedImages.length} | audios=${queuedAudios.length} | dayType=${dayType}`);
+
             const entries = Object.entries(data)
               .filter(([id, item]) => {
                 if (!item || item.status !== "queued") return false;
@@ -1336,16 +1342,116 @@ jobs:
               console.log(`Page URL before login: ${page.url()}`);
               console.log(`Page title before login: ${await page.title()}`);
 
-              // Handle cookie consent modal (appears for certain proxy regions e.g. US/EU IPs)
-              try {
-                const acceptBtn = page.locator('button:has-text("Accept All Cookies")');
-                await acceptBtn.waitFor({ state: "visible", timeout: 5000 });
-                await acceptBtn.click();
-                console.log("Cookie consent accepted.");
-                await page.waitForTimeout(1500);
-              } catch {
-                console.log("No cookie consent modal — proceeding.");
+              // ── COMPREHENSIVE ONE-TIME PRE-LOGIN MODAL / POPUP KILLER ──────
+              // Runs ONLY on the initial Zedge page load before login.
+              // We check in a loop for up to 8 seconds to handle dynamic/delayed popups,
+              // then exit permanently. This ensures we never interfere with subsequent
+              // upload modals or automation dialogs during the actual run.
+              // ────────────────────────────────────────────────────────────────
+              console.log("Running pre-login modal/popup killer...");
+              let modalDismissed = false;
+              const killerStart = Date.now();
+              const killerMaxWait = 8000; // 8 seconds max wait
+
+              const modalSelectors = [
+                'button:has-text("Close")',
+                'button:has-text("Do not Share or Sell my Personal Information")',
+                'button:has-text("Accept All Cookies")',
+                'button:has-text("Accept All")',
+                'button:has-text("Accept")',
+                'button:has-text("I Agree")',
+                'button:has-text("Agree")',
+                'button:has-text("OK")',
+                'button:has-text("Got it")',
+                'button:has-text("Dismiss")',
+                '[role="dialog"] button:has-text("Close")',
+                '[role="alertdialog"] button:has-text("Close")',
+              ];
+
+              while (Date.now() - killerStart < killerMaxWait) {
+                let clickedAny = false;
+                for (const selector of modalSelectors) {
+                  try {
+                    const btn = page.locator(selector).first();
+                    const visible = await btn.isVisible({ timeout: 200 }).catch(() => false);
+                    if (visible) {
+                      // Check if it's actually part of a privacy/consent overlay
+                      const isConsentOverlay = await btn.evaluate(el => {
+                        const inOverlay = el.closest(
+                          '[class*="modal"], [class*="overlay"], [class*="consent"], ' +
+                          '[class*="cookie"], [class*="privacy"], [class*="popup"], ' +
+                          '[class*="banner"], [class*="notice"], [class*="dialog"], ' +
+                          '[id*="consent"], [id*="cookie"], [id*="privacy"], ' +
+                          '[id*="modal"], [id*="popup"], [role="dialog"], [role="alertdialog"]'
+                        );
+                        return !!inOverlay;
+                      }).catch(() => false);
+
+                      if (isConsentOverlay) {
+                        await btn.click({ timeout: 2000 });
+                        console.log(`✅ Modal dismissed via: ${selector}`);
+                        modalDismissed = true;
+                        clickedAny = true;
+                        break;
+                      }
+                    }
+                  } catch (e) { /* ignore and try next */ }
+                }
+
+                if (clickedAny) {
+                  await page.waitForTimeout(1000);
+                  break; // exit loop if modal was dismissed
+                }
+                
+                // Fallback check: look for iframe consent dialogs or overlays and remove them
+                const nuked = await page.evaluate(() => {
+                  let killed = 0;
+                  // Remove any element that looks like a consent/privacy overlay/modal
+                  const elements = document.querySelectorAll(
+                    '[class*="consent"], [class*="cookie"], [class*="privacy"], ' +
+                    '[class*="modal"]:not([data-hook]), [class*="popup"], ' +
+                    '[id*="consent"], [id*="cookie"], [id*="privacy"]'
+                  );
+                  elements.forEach(el => {
+                    // Don't remove Zedge's own upload elements which have data-hook
+                    if (!el.querySelector('[data-hook]') && !el.closest('[data-hook]')) {
+                      el.remove();
+                      killed++;
+                    }
+                  });
+
+                  // Nuke consent iframes
+                  const iframes = document.querySelectorAll(
+                    'iframe[src*="consent"], iframe[src*="cookie"], iframe[src*="privacy"], ' +
+                    'iframe[id*="consent"], iframe[id*="cookie"]'
+                  );
+                  iframes.forEach(iframe => {
+                    iframe.remove();
+                    killed++;
+                  });
+
+                  if (killed > 0) {
+                    document.body.style.overflow = "";
+                    document.documentElement.style.overflow = "";
+                  }
+                  return killed;
+                }).catch(() => 0);
+
+                if (nuked > 0) {
+                  console.log(`✅ Force-removed ${nuked} overlay element(s) via JS`);
+                  modalDismissed = true;
+                  await page.waitForTimeout(1000);
+                  break;
+                }
+
+                await page.waitForTimeout(500);
               }
+
+              if (!modalDismissed) {
+                console.log("No consent/privacy modal detected — proceeding.");
+              }
+
+              await page.waitForTimeout(500);
 
               await safeClick(
                 page.locator('[data-hook="za-login-email"]').first(),
@@ -1395,6 +1501,12 @@ jobs:
                 try {
                   // Fetch the next queued item
                   queueItem = await getNextWallpaperFromRealtimeDB(dayType);
+
+                  // HARD TYPE GUARD: never allow wrong media type for the day
+                  const pickedIsMp3 = queueItem.isMp3 || (queueItem.name && queueItem.name.toLowerCase().endsWith(".mp3"));
+                  if ((dayType === "WALLPAPER" && pickedIsMp3) || (dayType === "AUDIO" && !pickedIsMp3)) {
+                    throw new Error(`Type guard blocked upload. dayType=${dayType}, pickedFile=${queueItem.name}, pickedIsMp3=${pickedIsMp3}`);
+                  }
                 } catch (e) {
                   console.log(`Queue is empty after ${successCount} upload(s). Stopping loop.`);
                   break;
