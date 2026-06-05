@@ -477,33 +477,56 @@ jobs:
 
           async function getNextWallpaperFromRealtimeDB(dayType) {
             console.log(`Checking Firebase Realtime Database queue... (Today's type: ${dayType})`);
+            console.log(`🗄️ Active DB: ${firebaseDatabaseURL}`);
             const data = await firebaseGet(queuePath);
-            if (!data) throw new Error("No items found in Realtime Database");
+            if (!data) throw new Error(`No items found in Realtime Database (${firebaseDatabaseURL})`);
 
-            // Full queue diagnostics (professional observability)
-            const allQueued = Object.entries(data).filter(([_, item]) => item && item.status === "queued");
-            const queuedAudios = allQueued.filter(([_, item]) => item && (item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3"))));
-            const queuedImages = allQueued.filter(([_, item]) => item && !(item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3"))));
-            console.log(`📊 Queue diagnostics | totalQueued=${allQueued.length} | images=${queuedImages.length} | audios=${queuedAudios.length} | dayType=${dayType}`);
+            const allQueued = Object.entries(data).filter(([_, item]) =>
+              item &&
+              item.status === "queued" &&
+              (item.fileBase64 || item.imageBase64)
+            );
 
-            const entries = Object.entries(data)
-              .filter(([id, item]) => {
-                if (!item || item.status !== "queued") return false;
-                if (!(item.fileBase64 || item.imageBase64)) return false;
+            const queuedAudio = allQueued.filter(([_, item]) =>
+              item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3"))
+            );
+            const queuedImage = allQueued.filter(([_, item]) =>
+              !(item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3")))
+            );
+
+            console.log(
+              `📊 Queue composition => total:${allQueued.length} | audio:${queuedAudio.length} | wallpaper:${queuedImage.length} | dayType:${dayType}`
+            );
+
+            const entries = allQueued
+              .filter(([_, item]) => {
                 const itemIsMp3 = item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3"));
                 if (dayType === "AUDIO")     return itemIsMp3;   // 🎵 Ringtone day — MP3 only
                 if (dayType === "WALLPAPER") return !itemIsMp3;  // 🖼️ Wallpaper day — images only
-                return true; // fallback: no type filter
+                return true;
               })
               .sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
 
-            if (!entries.length) throw new Error(`No queued ${dayType} item found — queue may be empty for today's upload type`);
+            if (!entries.length) {
+              const mismatchHint = dayType === "AUDIO"
+                ? `Today is AUDIO but queue has audio:${queuedAudio.length}, wallpaper:${queuedImage.length}`
+                : `Today is WALLPAPER but queue has wallpaper:${queuedImage.length}, audio:${queuedAudio.length}`;
+              throw new Error(`No queued ${dayType} item found. ${mismatchHint}. DB=${firebaseDatabaseURL}`);
+            }
 
             const [id, item] = entries[0];
             const localDir = path.join(process.cwd(), "downloads");
             fs.mkdirSync(localDir, { recursive: true });
-            
+
             const isMp3 = item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3"));
+
+            // Defensive guard (double-check)
+            if ((dayType === "AUDIO" && !isMp3) || (dayType === "WALLPAPER" && isMp3)) {
+              throw new Error(
+                `Day/type mismatch guard triggered. dayType=${dayType}, item=${item.name || id}, isMp3=${isMp3}`
+              );
+            }
+
             const isJpeg = item.name && item.name.toLowerCase().endsWith(".jpeg");
             const ext = isMp3 ? ".mp3" : (isJpeg ? ".jpeg" : ".jpg");
             const localFile = path.join(localDir, `${id}${ext}`);
@@ -617,6 +640,88 @@ jobs:
             await locator.waitFor({ state: "attached" });
             await locator.evaluate(el => {
               el.scrollIntoView({ block: "center", inline: "center" });
+            });
+          }
+
+          // Keep dismissing Zedge privacy/cookie/data-collection popups whenever they appear
+          async function installPrivacyPopupWatcher(page) {
+            await page.addInitScript(() => {
+              // Keep dismissing the Zedge data collection/privacy popup whenever it appears.
+              (() => {
+                if (window.__zedgePrivacyPopupWatcherInstalled) return;
+                window.__zedgePrivacyPopupWatcherInstalled = true;
+
+                const overlaySelectors = [
+                  '[role="dialog"]',
+                  '[role="alertdialog"]',
+                  '[class*="modal"]',
+                  '[class*="overlay"]',
+                  '[class*="consent"]',
+                  '[class*="cookie"]',
+                  '[class*="privacy"]',
+                  '[class*="popup"]',
+                  '[class*="notice"]',
+                  '[id*="modal"]',
+                  '[id*="popup"]',
+                  '[id*="consent"]',
+                  '[id*="cookie"]',
+                  '[id*="privacy"]'
+                ];
+
+                const buttonHints = ['close', 'dismiss', 'got it', 'ok', 'accept'];
+
+                const tryDismiss = () => {
+                  const overlays = [...document.querySelectorAll(overlaySelectors.join(', '))];
+
+                  for (const overlay of overlays) {
+                    const text = (overlay.innerText || '').toLowerCase();
+                    const looksRelevant =
+                      text.includes('data collection') ||
+                      text.includes('privacy policy') ||
+                      text.includes('personal information') ||
+                      text.includes('consent') ||
+                      text.includes('privacy') ||
+                      text.includes('cookie');
+
+                    if (!looksRelevant) continue;
+
+                    const buttons = [...overlay.querySelectorAll('button, [role="button"], a')];
+                    const closeButton = buttons.find(btn => {
+                      const label = `${btn.textContent || ''} ${btn.getAttribute('aria-label') || ''} ${btn.getAttribute('title') || ''}`.toLowerCase();
+                      return buttonHints.some(hint => label.includes(hint));
+                    });
+
+                    if (closeButton) {
+                      closeButton.click();
+                      return true;
+                    }
+                  }
+
+                  return false;
+                };
+
+                const start = () => {
+                  tryDismiss();
+
+                  const observer = new MutationObserver(() => {
+                    tryDismiss();
+                  });
+
+                  observer.observe(document.documentElement, {
+                    subtree: true,
+                    childList: true,
+                    attributes: true
+                  });
+
+                  setInterval(tryDismiss, 500);
+                };
+
+                if (document.documentElement) {
+                  start();
+                } else {
+                  document.addEventListener('DOMContentLoaded', start, { once: true });
+                }
+              })();
             });
           }
 
@@ -1320,6 +1425,9 @@ jobs:
 
               const page = await context.newPage();
 
+              // Install persistent background watcher for Zedge privacy/cookie popups
+              await installPrivacyPopupWatcher(page);
+
               await page.setExtraHTTPHeaders({
                 "Accept-Language": "en-US,en;q=0.9"
               });
@@ -1402,7 +1510,7 @@ jobs:
                   await page.waitForTimeout(1000);
                   break; // exit loop if modal was dismissed
                 }
-                
+
                 // Fallback check: look for iframe consent dialogs or overlays and remove them
                 const nuked = await page.evaluate(() => {
                   let killed = 0;
@@ -1447,11 +1555,7 @@ jobs:
                 await page.waitForTimeout(500);
               }
 
-              if (!modalDismissed) {
-                console.log("No consent/privacy modal detected — proceeding.");
-              }
-
-              await page.waitForTimeout(500);
+              console.log(`Pre-login popup killer completed. Dismissed something: ${modalDismissed}`);
 
               await safeClick(
                 page.locator('[data-hook="za-login-email"]').first(),
@@ -1501,12 +1605,6 @@ jobs:
                 try {
                   // Fetch the next queued item
                   queueItem = await getNextWallpaperFromRealtimeDB(dayType);
-
-                  // HARD TYPE GUARD: never allow wrong media type for the day
-                  const pickedIsMp3 = queueItem.isMp3 || (queueItem.name && queueItem.name.toLowerCase().endsWith(".mp3"));
-                  if ((dayType === "WALLPAPER" && pickedIsMp3) || (dayType === "AUDIO" && !pickedIsMp3)) {
-                    throw new Error(`Type guard blocked upload. dayType=${dayType}, pickedFile=${queueItem.name}, pickedIsMp3=${pickedIsMp3}`);
-                  }
                 } catch (e) {
                   console.log(`Queue is empty after ${successCount} upload(s). Stopping loop.`);
                   break;
