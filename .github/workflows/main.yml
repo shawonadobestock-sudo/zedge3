@@ -643,6 +643,129 @@ jobs:
             });
           }
 
+          async function dismissConsentPopup(page) {
+            console.log("Checking for consent/cookie popups in all frames...");
+            let clickedAny = false;
+            
+            const targetTexts = [
+              "accept all cookies",
+              "accept all",
+              "reject optional cookies",
+              "accept cookies",
+              "agree to all",
+              "i agree",
+              "agree",
+              "got it",
+              "dismiss",
+              "close"
+            ];
+            
+            for (const frame of page.frames()) {
+              try {
+                const buttons = await frame.$$('button, [role="button"], a');
+                for (const btn of buttons) {
+                  try {
+                    if (!(await btn.isVisible())) continue;
+                    
+                    const text = (await btn.innerText().catch(() => "")).trim().toLowerCase();
+                    const ariaLabel = (await btn.getAttribute("aria-label").catch(() => "") || "").toLowerCase();
+                    const title = (await btn.getAttribute("title").catch(() => "") || "").toLowerCase();
+                    const id = (await btn.getAttribute("id").catch(() => "") || "").toLowerCase();
+                    const className = (await btn.getAttribute("class").catch(() => "") || "").toLowerCase();
+                    
+                    const combined = `${text} ${ariaLabel} ${title} ${id} ${className}`;
+                    
+                    let shouldClick = false;
+                    for (const target of targetTexts) {
+                      if (text === target || ariaLabel === target || title === target) {
+                        shouldClick = true;
+                        break;
+                      }
+                    }
+                    
+                    if (!shouldClick) {
+                      if (
+                        combined.includes("accept all cookies") ||
+                        combined.includes("accept all") ||
+                        combined.includes("reject optional cookies") ||
+                        combined.includes("accept cookies") ||
+                        combined.includes("agree to all") ||
+                        combined.includes("i agree")
+                      ) {
+                        shouldClick = true;
+                      }
+                    }
+                    
+                    if (!shouldClick) {
+                      const isCloseChar = text === "×" || text === "x" || ariaLabel === "close" || title === "close" || text === "close";
+                      if (isCloseChar) {
+                        const inOverlay = await btn.evaluate(el => {
+                          const overlay = el.closest(
+                            '[class*="modal"], [class*="overlay"], [class*="consent"], ' +
+                            '[class*="cookie"], [class*="privacy"], [class*="popup"], ' +
+                            '[class*="banner"], [class*="notice"], [class*="dialog"], ' +
+                            '[id*="consent"], [id*="cookie"], [id*="privacy"], ' +
+                            '[id*="modal"], [id*="popup"], [role="dialog"], [role="alertdialog"]'
+                          );
+                          return !!overlay;
+                        }).catch(() => false);
+                        
+                        if (inOverlay) {
+                          shouldClick = true;
+                        }
+                      }
+                    }
+                    
+                    if (shouldClick) {
+                      console.log(`✅ Clicked consent element: "${text || ariaLabel || title || "X"}" in frame: ${frame.url()}`);
+                      await btn.click().catch(() => {});
+                      clickedAny = true;
+                      await page.waitForTimeout(500);
+                    }
+                  } catch (e) {}
+                }
+              } catch (e) {}
+            }
+            
+            try {
+              const nuked = await page.evaluate(() => {
+                let killed = 0;
+                const elements = document.querySelectorAll(
+                  '[class*="consent"], [class*="cookie"], [class*="privacy"], ' +
+                  '[class*="modal"]:not([data-hook]), [class*="popup"], ' +
+                  '[id*="consent"], [id*="cookie"], [id*="privacy"]'
+                );
+                elements.forEach(el => {
+                  if (!el.querySelector("[data-hook]") && !el.closest("[data-hook]")) {
+                    el.remove();
+                    killed++;
+                  }
+                });
+                
+                const iframes = document.querySelectorAll(
+                  'iframe[src*="consent"], iframe[src*="cookie"], iframe[src*="privacy"], ' +
+                  'iframe[id*="consent"], iframe[id*="cookie"]'
+                );
+                iframes.forEach(iframe => {
+                  iframe.remove();
+                  killed++;
+                });
+                
+                if (killed > 0) {
+                  document.body.style.overflow = "";
+                  document.documentElement.style.overflow = "";
+                }
+                return killed;
+              });
+              if (nuked > 0) {
+                console.log(`✅ JS removed ${nuked} blocking elements.`);
+                clickedAny = true;
+              }
+            } catch (e) {}
+            
+            return clickedAny;
+          }
+
           // Keep dismissing Zedge privacy/cookie/data-collection popups whenever they appear
           async function installPrivacyPopupWatcher(page) {
             await page.addInitScript(() => {
@@ -1452,107 +1575,20 @@ jobs:
 
               // ── COMPREHENSIVE ONE-TIME PRE-LOGIN MODAL / POPUP KILLER ──────
               // Runs ONLY on the initial Zedge page load before login.
-              // We check in a loop for up to 8 seconds to handle dynamic/delayed popups,
-              // then exit permanently. This ensures we never interfere with subsequent
-              // upload modals or automation dialogs during the actual run.
+              // We check in a loop for up to 10 seconds to handle dynamic/delayed popups,
+              // and continue checking even if a popup is dismissed (in case there are multiple stages).
               // ────────────────────────────────────────────────────────────────
               console.log("Running pre-login modal/popup killer...");
               let modalDismissed = false;
               const killerStart = Date.now();
-              const killerMaxWait = 8000; // 8 seconds max wait
-
-              const modalSelectors = [
-                'button:has-text("Close")',
-                'button:has-text("Do not Share or Sell my Personal Information")',
-                'button:has-text("Accept All Cookies")',
-                'button:has-text("Accept All")',
-                'button:has-text("Accept")',
-                'button:has-text("I Agree")',
-                'button:has-text("Agree")',
-                'button:has-text("OK")',
-                'button:has-text("Got it")',
-                'button:has-text("Dismiss")',
-                '[role="dialog"] button:has-text("Close")',
-                '[role="alertdialog"] button:has-text("Close")',
-              ];
+              const killerMaxWait = 10000; // 10 seconds max wait
 
               while (Date.now() - killerStart < killerMaxWait) {
-                let clickedAny = false;
-                for (const selector of modalSelectors) {
-                  try {
-                    const btn = page.locator(selector).first();
-                    const visible = await btn.isVisible({ timeout: 200 }).catch(() => false);
-                    if (visible) {
-                      // Check if it's actually part of a privacy/consent overlay
-                      const isConsentOverlay = await btn.evaluate(el => {
-                        const inOverlay = el.closest(
-                          '[class*="modal"], [class*="overlay"], [class*="consent"], ' +
-                          '[class*="cookie"], [class*="privacy"], [class*="popup"], ' +
-                          '[class*="banner"], [class*="notice"], [class*="dialog"], ' +
-                          '[id*="consent"], [id*="cookie"], [id*="privacy"], ' +
-                          '[id*="modal"], [id*="popup"], [role="dialog"], [role="alertdialog"]'
-                        );
-                        return !!inOverlay;
-                      }).catch(() => false);
-
-                      if (isConsentOverlay) {
-                        await btn.click({ timeout: 2000 });
-                        console.log(`✅ Modal dismissed via: ${selector}`);
-                        modalDismissed = true;
-                        clickedAny = true;
-                        break;
-                      }
-                    }
-                  } catch (e) { /* ignore and try next */ }
-                }
-
-                if (clickedAny) {
-                  await page.waitForTimeout(1000);
-                  break; // exit loop if modal was dismissed
-                }
-
-                // Fallback check: look for iframe consent dialogs or overlays and remove them
-                const nuked = await page.evaluate(() => {
-                  let killed = 0;
-                  // Remove any element that looks like a consent/privacy overlay/modal
-                  const elements = document.querySelectorAll(
-                    '[class*="consent"], [class*="cookie"], [class*="privacy"], ' +
-                    '[class*="modal"]:not([data-hook]), [class*="popup"], ' +
-                    '[id*="consent"], [id*="cookie"], [id*="privacy"]'
-                  );
-                  elements.forEach(el => {
-                    // Don't remove Zedge's own upload elements which have data-hook
-                    if (!el.querySelector('[data-hook]') && !el.closest('[data-hook]')) {
-                      el.remove();
-                      killed++;
-                    }
-                  });
-
-                  // Nuke consent iframes
-                  const iframes = document.querySelectorAll(
-                    'iframe[src*="consent"], iframe[src*="cookie"], iframe[src*="privacy"], ' +
-                    'iframe[id*="consent"], iframe[id*="cookie"]'
-                  );
-                  iframes.forEach(iframe => {
-                    iframe.remove();
-                    killed++;
-                  });
-
-                  if (killed > 0) {
-                    document.body.style.overflow = "";
-                    document.documentElement.style.overflow = "";
-                  }
-                  return killed;
-                }).catch(() => 0);
-
-                if (nuked > 0) {
-                  console.log(`✅ Force-removed ${nuked} overlay element(s) via JS`);
+                const dismissed = await dismissConsentPopup(page);
+                if (dismissed) {
                   modalDismissed = true;
-                  await page.waitForTimeout(1000);
-                  break;
                 }
-
-                await page.waitForTimeout(500);
+                await page.waitForTimeout(1000);
               }
 
               console.log(`Pre-login popup killer completed. Dismissed something: ${modalDismissed}`);
