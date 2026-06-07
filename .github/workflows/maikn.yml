@@ -1,0 +1,62 @@
+name: Temp Delete Specific R2 Files
+
+on:
+  workflow_dispatch:
+
+jobs:
+  delete-files:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete 3 specific files via Worker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKER_URL="https://frosty-pine-2f7dzedge-r2-gateway.holaexplainer.workers.dev"
+          KEYS=(
+            "zedge3/-OuD-rsubKShQJ0krIQW.jpg"
+            "zedge3/-OuD03Gvu-RYuUtIDBaE.jpg"
+            "zedge3/-OuD06cnrdWaBTDqnsBv.jpg"
+          )
+
+          echo "Starting R2 delete job..."
+          for key in "${KEYS[@]}"; do
+            echo "--------------------------------------------"
+            echo "Deleting key: $key"
+
+            HTTP_CODE=$(curl -sS -o response.txt -w "%{http_code}" \
+              -X DELETE "$WORKER_URL" \
+              -H "X-File-Name: $key")
+
+            echo "HTTP: $HTTP_CODE"
+            echo "Body:"
+            cat response.txt || true
+            echo
+
+            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+              echo "Delete failed for $key"
+              exit 1
+            fi
+          done
+
+          echo "All delete calls finished."
+
+      - name: Verify with cache-busting GET
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="https://pub-d754b7c6ca88499fb4fdbd274a5a6730.r2.dev"
+          URLS=(
+            "$BASE/zedge3/-OuD-rsubKShQJ0krIQW.jpg"
+            "$BASE/zedge3/-OuD03Gvu-RYuUtIDBaE.jpg"
+            "$BASE/zedge3/-OuD06cnrdWaBTDqnsBv.jpg"
+          )
+
+          echo "Verification requests (expect 404/403 or cached 200 briefly):"
+          for u in "${URLS[@]}"; do
+            bust="$(date +%s%N)"
+            full="${u}?cb=${bust}"
+            code=$(curl -sS -o /dev/null -w "%{http_code}" "$full")
+            echo "$full => HTTP $code"
+          done
