@@ -575,22 +575,43 @@ jobs:
             console.log(`"${name}" permanently removed from Firebase queue`);
 
             if (fileUrl) {
-              const fileKey = fileUrl.replace("https://pub-your-bucket-id.r2.dev/", "");
+              let fileKey = "";
               try {
-                console.log(`Deleting R2 object: ${fileKey}`);
+                const u = new URL(fileUrl);
+                fileKey = decodeURIComponent(u.pathname.replace(/^\/+/, ""));
+              } catch {
+                // fallback for malformed URL strings
+                fileKey = String(fileUrl).replace(/^https?:\/\/[^/]+\//i, "");
+              }
+
+              try {
+                console.log(`R2 delete request => fileUrl: ${fileUrl}`);
+                console.log(`R2 delete request => parsed key: ${fileKey}`);
+
                 const res = await fetch(r2WorkerUrl, {
                   method: "DELETE",
                   headers: {
                     "X-File-Name": fileKey
                   }
                 });
+
+                const body = await res.text().catch(() => "");
                 if (res.ok) {
-                  console.log(`Successfully deleted ${fileKey} from Cloudflare R2.`);
+                  console.log(`Successfully deleted key "${fileKey}" from Cloudflare R2. Status=${res.status} Body=${body}`);
                 } else {
-                  console.warn(`R2 delete returned status ${res.status}`);
+                  console.warn(`R2 delete failed for key "${fileKey}". Status=${res.status} Body=${body}`);
+                }
+
+                // Optional verification with cache-buster (non-blocking)
+                try {
+                  const verifyUrl = `${fileUrl}${fileUrl.includes("?") ? "&" : "?"}cb=${Date.now()}`;
+                  const vr = await fetch(verifyUrl, { method: "GET", cache: "no-store" });
+                  console.log(`Post-delete verification GET => ${verifyUrl} returned HTTP ${vr.status}`);
+                } catch (vErr) {
+                  console.log(`Post-delete verification skipped/failed: ${vErr.message}`);
                 }
               } catch (err) {
-                console.error(`Failed to delete ${fileKey} from R2:`, err.message);
+                console.error(`Failed to delete "${fileKey}" from R2:`, err.message);
               }
             }
           }
