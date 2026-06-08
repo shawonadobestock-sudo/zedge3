@@ -1798,6 +1798,9 @@ jobs:
               await new Promise(resolve => setTimeout(resolve, 2000));
               console.log("✅ Video recording finalized.");
               await browser.close();
+              
+              // Exit cleanly to allow GitHub Actions to proceed to artifact upload
+              process.exit(0);
 
             } catch (err) {
               console.error("BOT FATAL ERROR:", err);
