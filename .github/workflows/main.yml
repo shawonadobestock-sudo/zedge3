@@ -815,84 +815,10 @@ jobs:
 
           // Keep dismissing Zedge privacy/cookie/data-collection popups whenever they appear
           async function installPrivacyPopupWatcher(page) {
-            await page.addInitScript(() => {
-              // Keep dismissing the Zedge data collection/privacy popup whenever it appears.
-              (() => {
-                if (window.__zedgePrivacyPopupWatcherInstalled) return;
-                window.__zedgePrivacyPopupWatcherInstalled = true;
-
-                const overlaySelectors = [
-                  '[role="dialog"]',
-                  '[role="alertdialog"]',
-                  '[class*="modal"]',
-                  '[class*="overlay"]',
-                  '[class*="consent"]',
-                  '[class*="cookie"]',
-                  '[class*="privacy"]',
-                  '[class*="popup"]',
-                  '[class*="notice"]',
-                  '[id*="modal"]',
-                  '[id*="popup"]',
-                  '[id*="consent"]',
-                  '[id*="cookie"]',
-                  '[id*="privacy"]'
-                ];
-
-                const buttonHints = ['close', 'dismiss', 'got it', 'ok', 'accept'];
-
-                const tryDismiss = () => {
-                  const overlays = [...document.querySelectorAll(overlaySelectors.join(', '))];
-
-                  for (const overlay of overlays) {
-                    const text = (overlay.innerText || '').toLowerCase();
-                    const looksRelevant =
-                      text.includes('data collection') ||
-                      text.includes('privacy policy') ||
-                      text.includes('personal information') ||
-                      text.includes('consent') ||
-                      text.includes('privacy') ||
-                      text.includes('cookie');
-
-                    if (!looksRelevant) continue;
-
-                    const buttons = [...overlay.querySelectorAll('button, [role="button"], a')];
-                    const closeButton = buttons.find(btn => {
-                      const label = `${btn.textContent || ''} ${btn.getAttribute('aria-label') || ''} ${btn.getAttribute('title') || ''}`.toLowerCase();
-                      return buttonHints.some(hint => label.includes(hint));
-                    });
-
-                    if (closeButton) {
-                      closeButton.click();
-                      return true;
-                    }
-                  }
-
-                  return false;
-                };
-
-                const start = () => {
-                  tryDismiss();
-
-                  const observer = new MutationObserver(() => {
-                    tryDismiss();
-                  });
-
-                  observer.observe(document.documentElement, {
-                    subtree: true,
-                    childList: true,
-                    attributes: true
-                  });
-
-                  setInterval(tryDismiss, 500);
-                };
-
-                if (document.documentElement) {
-                  start();
-                } else {
-                  document.addEventListener('DOMContentLoaded', start, { once: true });
-                }
-              })();
-            });
+            // DISABLED: This automatic watcher was interfering with the explicit Didomi cookie consent handler
+            // by auto-clicking buttons before the proper consent flow could complete.
+            // The Didomi consent modal is now handled explicitly after page load.
+            console.log("Privacy popup auto-watcher is disabled - using explicit Didomi handler instead");
           }
 
           async function forceCheckByDataHook(page, dataHookValue, label) {
@@ -1620,67 +1546,58 @@ jobs:
               console.log(`Page URL before login: ${page.url()}`);
               console.log(`Page title before login: ${await page.title()}`);
 
-              // ── DIDOMI CONSENT POPUP KILLER (New Method) ──────
-              // Specifically targets the Didomi consent modal that appears before login
-              // Uses direct DOM manipulation based on actual popup HTML structure
+              // ── DIDOMI CONSENT POPUP HANDLER ──────────────────
+              // Handles the Didomi cookie consent modal by clicking Accept/Close button
+              // This ensures proper consent is registered with the website
               // ──────────────────────────────────────────────────────────────
-              console.log("Running Didomi consent popup killer...");
+              console.log("Checking for Didomi cookie consent modal...");
               
-              const didomiKilled = await page.evaluate(() => {
-                try {
-                  let killed = false;
+              try {
+                // Wait for Didomi modal to appear (with timeout)
+                const didomiModal = page.locator('#didomi-host');
+                const modalVisible = await didomiModal.isVisible().catch(() => false);
+                
+                if (modalVisible) {
+                  console.log("✅ Didomi consent modal detected - handling cookie consent...");
                   
-                  // Remove the didomi-popup-open class from body
-                  if (document.body.classList.contains('didomi-popup-open')) {
-                    document.body.classList.remove('didomi-popup-open');
-                    document.body.style.overflow = '';
-                    killed = true;
-                    console.log("✅ Removed didomi-popup-open class from body");
+                  // Try to click Accept/Close button
+                  const acceptButton = page.locator('#didomi-notice-agree-button');
+                  const acceptExists = await acceptButton.isVisible({ timeout: 3000 }).catch(() => false);
+                  
+                  if (acceptExists) {
+                    console.log('Clicking "Accept All Cookies" or "Close" button...');
+                    await acceptButton.click();
+                    await page.waitForTimeout(1000);
+                    console.log('✅ Successfully clicked Accept/Close button');
+                  } else {
+                    // Fallback: Try "Do not Share/Sell" button if Accept not found
+                    const learnMoreButton = page.locator('#didomi-notice-learn-more-button');
+                    const learnMoreExists = await learnMoreButton.isVisible({ timeout: 2000 }).catch(() => false);
+                    
+                    if (learnMoreExists) {
+                      console.log('Clicking "Do not Share or Sell my Personal Information" button...');
+                      await learnMoreButton.click();
+                      await page.waitForTimeout(1000);
+                      console.log('✅ Successfully clicked "Do not Share or Sell" button');
+                    } else {
+                      console.log('⚠️ No clickable Didomi buttons found - modal may require manual intervention');
+                    }
                   }
                   
-                  // Remove Didomi backdrop
-                  const backdrop = document.querySelector('.didomi-popup-backdrop');
-                  if (backdrop) {
-                    backdrop.remove();
-                    killed = true;
-                    console.log("✅ Removed Didomi backdrop");
+                  // Verify modal is gone
+                  await page.waitForTimeout(500);
+                  const stillVisible = await didomiModal.isVisible().catch(() => false);
+                  if (!stillVisible) {
+                    console.log("✅ Didomi consent modal successfully dismissed");
+                  } else {
+                    console.log("⚠️ Modal may still be visible, proceeding anyway...");
                   }
-                  
-                  // Remove Didomi host container
-                  const didomiHost = document.getElementById('didomi-host');
-                  if (didomiHost) {
-                    didomiHost.remove();
-                    killed = true;
-                    console.log("✅ Removed Didomi host container");
-                  }
-                  
-                  // Remove any remaining Didomi-related elements
-                  const didomiElements = document.querySelectorAll('[id*="didomi"], [class*="didomi"]');
-                  if (didomiElements.length > 0) {
-                    didomiElements.forEach(el => el.remove());
-                    killed = true;
-                    console.log(`✅ Removed ${didomiElements.length} additional Didomi elements`);
-                  }
-                  
-                  // Remove GPC iframe if present
-                  const gppLocator = document.querySelector('iframe[name="__gppLocator"]');
-                  if (gppLocator) {
-                    gppLocator.remove();
-                    console.log("✅ Removed GPC locator iframe");
-                  }
-                  
-                  return killed;
-                } catch (err) {
-                  console.error("Didomi killer error:", err.message);
-                  return false;
+                } else {
+                  console.log("ℹ️ No Didomi consent modal detected (already dismissed or not present)");
                 }
-              });
-              
-              if (didomiKilled) {
-                console.log("✅ Didomi consent popup successfully removed");
-                await page.waitForTimeout(500); // Brief pause for DOM to stabilize
-              } else {
-                console.log("ℹ️ No Didomi popup detected (may have already been dismissed)");
+              } catch (err) {
+                console.error("⚠️ Error handling Didomi consent:", err.message);
+                console.log("Attempting to proceed with login anyway...");
               }
 
               await safeClick(
@@ -1862,7 +1779,24 @@ jobs:
 
               console.log(`\n🏁 Run complete. ${successCount} upload(s) succeeded.`);
 
+              // Save video recording before closing browser
+              console.log("\n📹 Saving screen recording...");
+              try {
+                const pages = context.pages();
+                if (pages.length > 0) {
+                  const videoPath = await pages[0].video()?.path();
+                  if (videoPath) {
+                    console.log(`✅ Video saved to: ${videoPath}`);
+                  }
+                }
+              } catch (videoErr) {
+                console.warn("⚠️ Could not retrieve video path:", videoErr.message);
+              }
+
               await context.close();
+              // Wait 2 seconds for video to finish writing to disk
+              await new Promise(resolve => setTimeout(resolve, 2000));
+              console.log("✅ Video recording finalized.");
               await browser.close();
 
             } catch (err) {
