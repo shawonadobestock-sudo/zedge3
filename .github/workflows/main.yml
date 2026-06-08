@@ -1620,25 +1620,68 @@ jobs:
               console.log(`Page URL before login: ${page.url()}`);
               console.log(`Page title before login: ${await page.title()}`);
 
-              // ── COMPREHENSIVE ONE-TIME PRE-LOGIN MODAL / POPUP KILLER ──────
-              // Runs ONLY on the initial Zedge page load before login.
-              // We check in a loop for up to 10 seconds to handle dynamic/delayed popups,
-              // and continue checking even if a popup is dismissed (in case there are multiple stages).
-              // ────────────────────────────────────────────────────────────────
-              console.log("Running pre-login modal/popup killer...");
-              let modalDismissed = false;
-              const killerStart = Date.now();
-              const killerMaxWait = 10000; // 10 seconds max wait
-
-              while (Date.now() - killerStart < killerMaxWait) {
-                const dismissed = await dismissConsentPopup(page);
-                if (dismissed) {
-                  modalDismissed = true;
+              // ── DIDOMI CONSENT POPUP KILLER (New Method) ──────
+              // Specifically targets the Didomi consent modal that appears before login
+              // Uses direct DOM manipulation based on actual popup HTML structure
+              // ──────────────────────────────────────────────────────────────
+              console.log("Running Didomi consent popup killer...");
+              
+              const didomiKilled = await page.evaluate(() => {
+                try {
+                  let killed = false;
+                  
+                  // Remove the didomi-popup-open class from body
+                  if (document.body.classList.contains('didomi-popup-open')) {
+                    document.body.classList.remove('didomi-popup-open');
+                    document.body.style.overflow = '';
+                    killed = true;
+                    console.log("✅ Removed didomi-popup-open class from body");
+                  }
+                  
+                  // Remove Didomi backdrop
+                  const backdrop = document.querySelector('.didomi-popup-backdrop');
+                  if (backdrop) {
+                    backdrop.remove();
+                    killed = true;
+                    console.log("✅ Removed Didomi backdrop");
+                  }
+                  
+                  // Remove Didomi host container
+                  const didomiHost = document.getElementById('didomi-host');
+                  if (didomiHost) {
+                    didomiHost.remove();
+                    killed = true;
+                    console.log("✅ Removed Didomi host container");
+                  }
+                  
+                  // Remove any remaining Didomi-related elements
+                  const didomiElements = document.querySelectorAll('[id*="didomi"], [class*="didomi"]');
+                  if (didomiElements.length > 0) {
+                    didomiElements.forEach(el => el.remove());
+                    killed = true;
+                    console.log(`✅ Removed ${didomiElements.length} additional Didomi elements`);
+                  }
+                  
+                  // Remove GPC iframe if present
+                  const gppLocator = document.querySelector('iframe[name="__gppLocator"]');
+                  if (gppLocator) {
+                    gppLocator.remove();
+                    console.log("✅ Removed GPC locator iframe");
+                  }
+                  
+                  return killed;
+                } catch (err) {
+                  console.error("Didomi killer error:", err.message);
+                  return false;
                 }
-                await page.waitForTimeout(1000);
+              });
+              
+              if (didomiKilled) {
+                console.log("✅ Didomi consent popup successfully removed");
+                await page.waitForTimeout(500); // Brief pause for DOM to stabilize
+              } else {
+                console.log("ℹ️ No Didomi popup detected (may have already been dismissed)");
               }
-
-              console.log(`Pre-login popup killer completed. Dismissed something: ${modalDismissed}`);
 
               await safeClick(
                 page.locator('[data-hook="za-login-email"]').first(),
