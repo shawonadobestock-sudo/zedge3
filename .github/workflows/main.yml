@@ -371,6 +371,20 @@ jobs:
             }
           }
 
+          function getDhakaGreeting() {
+            try {
+              const dhakaHour = parseInt(new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka", hour: "2-digit", hour12: false }), 10);
+              let greetingTime = "good day";
+              if (dhakaHour >= 5 && dhakaHour < 12) greetingTime = "good morning";
+              else if (dhakaHour >= 12 && dhakaHour < 17) greetingTime = "good afternoon";
+              else if (dhakaHour >= 17 && dhakaHour < 22) greetingTime = "good evening";
+              else greetingTime = "good night";
+              return `Hi Shawon, ${greetingTime}`;
+            } catch (_) {
+              return "Hi Shawon";
+            }
+          }
+
           // --- PROFILE ROTATION STATE MANAGER ---
 
           // Returns the next profile index whose upload count is still below perProfileLimit.
@@ -2018,12 +2032,14 @@ jobs:
                   successCount++;
 
                   const folderLabel = process.env.FOLDER_NAME || "Zedge Bot";
+                  const fileType = queueItem.isMp3 ? "audio file" : "wallpaper file";
+                  const greeting = getDhakaGreeting();
                   let notifyMsg = "";
                   if (publishResult.removed) {
-                    notifyMsg = `Sir, Zedge auto-removed "${queueItem.name}" on ${folderLabel} (Profile #${currentProfileIndex}). Status: ${publishResult.statusName}.`;
+                    notifyMsg = `${greeting}. Zedge auto-removed the ${fileType} "${queueItem.name}" on ${folderLabel} (Profile #${currentProfileIndex}). Status: ${publishResult.statusName}.`;
                     console.log(`⚠️ Upload ${uploadNum} was removed from Zedge (Status: ${publishResult.statusName}). Counted as upload attempt. (${successCount} this run)`);
                   } else {
-                    notifyMsg = `Hi, just uploaded "${queueItem.title || queueItem.name}" to Profile #${currentProfileIndex} on ${folderLabel}.`;
+                    notifyMsg = `${greeting}. I just uploaded the ${fileType} "${queueItem.title || queueItem.name}" to Profile #${currentProfileIndex} on ${folderLabel}.`;
                     console.log(`✅ Upload ${uploadNum} complete! Status: ${publishResult.statusName}. (${successCount} this run)`);
                   }
                   await sendFacebookNotification(notifyMsg);
@@ -2039,8 +2055,9 @@ jobs:
                   // Notify user of upload failure
                   try {
                     const errFolder = process.env.FOLDER_NAME || "Zedge Bot";
+                    const fileType = queueItem?.isMp3 ? "audio file" : "wallpaper file";
                     const errSnippet = String(uploadErr.message || "Unknown error").slice(0, 120);
-                    const uploadErrMsg = `Hi, I couldn't upload "${queueItem?.name || "N/A"}" on ${errFolder} (Profile #${currentProfileIndex}): ${errSnippet}. Trying the next one.`;
+                    const uploadErrMsg = `${getDhakaGreeting()}. I couldn't upload the ${fileType} "${queueItem?.name || "N/A"}" on ${errFolder} (Profile #${currentProfileIndex}): ${errSnippet}. Trying the next one.`;
                     await sendFacebookNotification(uploadErrMsg);
                   } catch (_) {}
                 }
@@ -2092,7 +2109,7 @@ jobs:
               try {
                 const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
                 const crashSnippet = String(err?.message || err || "Unknown fatal error").slice(0, 150);
-                const fatalMsg = `Sir, the ${crashFolder} run has stopped due to an error: ${crashSnippet}.`;
+                const fatalMsg = `${getDhakaGreeting()}. The ${crashFolder} run has stopped due to an error: ${crashSnippet}.`;
                 await sendFacebookNotification(fatalMsg);
               } catch (_) {}
               if (context) await context.close().catch(() => {});
