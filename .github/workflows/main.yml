@@ -739,7 +739,6 @@ jobs:
             console.log("Checking for consent/cookie popups in all frames...");
             let clickedAny = false;
 
-            // Strict priority: always prefer positive consent buttons
             const acceptPriority = [
               "accept all cookies",
               "accept all",
@@ -758,62 +757,96 @@ jobs:
               "understand"
             ];
 
-            // Hard negative guard: never click these
             const negativeWords = ["reject", "disagree", "decline", "optional", "deny"];
+
+            const socialOrLoginKeywords = [
+              "facebook", "google", "apple", "email", "password", 
+              "login", "log in", "signin", "sign in", "signup", "sign up", 
+              "register", "create account", "continue with", "facebook lite", "sign up"
+            ];
 
             for (const frame of page.frames()) {
               try {
-                const buttons = await frame.$$("button, [role='button'], a");
+                const clicked = await frame.evaluate(({ acceptPriority, negativeWords, socialOrLoginKeywords }) => {
+                  const buttons = Array.from(document.querySelectorAll("button, [role='button'], a"));
+                  
+                  const isLoginPage = window.location.href.includes("account.zedge.net") || 
+                                       window.location.href.includes("login") || 
+                                       !!document.querySelector('input[type="email"], input[type="password"]');
 
-                // Collect visible candidates first
-                const candidates = [];
-                for (const btn of buttons) {
-                  try {
-                    if (!(await btn.isVisible())) continue;
-                    const text = (await btn.innerText().catch(() => "")).trim().toLowerCase();
-                    const ariaLabel = (await btn.getAttribute("aria-label").catch(() => "") || "").toLowerCase();
-                    const title = (await btn.getAttribute("title").catch(() => "") || "").toLowerCase();
-                    const id = (await btn.getAttribute("id").catch(() => "") || "").toLowerCase();
-                    const className = (await btn.getAttribute("class").catch(() => "") || "").toLowerCase();
+                  const isConsentContainer = (el) => {
+                    let cur = el;
+                    while (cur) {
+                      const id = (cur.id || "").toLowerCase();
+                      const className = (typeof cur.className === "string" ? cur.className : "").toLowerCase();
+                      const role = (cur.getAttribute?.("role") || "").toLowerCase();
+                      if (id.includes("didomi") || className.includes("didomi") ||
+                          id.includes("consent") || className.includes("consent") ||
+                          id.includes("cookie") || className.includes("cookie") ||
+                          id.includes("privacy") || className.includes("privacy") ||
+                          id.includes("popup") || className.includes("popup") ||
+                          role === "dialog" || role === "alertdialog") {
+                        return true;
+                      }
+                      cur = cur.parentElement;
+                    }
+                    return false;
+                  };
+
+                  const candidates = [];
+                  for (const btn of buttons) {
+                    const rect = btn.getBoundingClientRect();
+                    const isVisible = rect.width > 0 && rect.height > 0 && 
+                                      window.getComputedStyle(btn).display !== "none" && 
+                                      window.getComputedStyle(btn).visibility !== "hidden";
+                    if (!isVisible) continue;
+
+                    const text = (btn.innerText || "").trim().toLowerCase();
+                    const ariaLabel = (btn.getAttribute("aria-label") || "").trim().toLowerCase();
+                    const title = (btn.getAttribute("title") || "").trim().toLowerCase();
+                    const id = (btn.id || "").trim().toLowerCase();
+                    const className = (typeof btn.className === "string" ? btn.className : "").trim().toLowerCase();
                     const combined = `${text} ${ariaLabel} ${title} ${id} ${className}`.trim();
 
                     if (!combined) continue;
+
                     if (negativeWords.some(w => combined.includes(w))) continue;
+                    if (socialOrLoginKeywords.some(w => combined.includes(w))) continue;
+                    if (isLoginPage && !isConsentContainer(btn)) continue;
 
                     candidates.push({ btn, text, ariaLabel, title, combined });
-                  } catch (_) {}
-                }
-
-                // Pass 1: strict priority phrase match
-                let clickedInFrame = false;
-                for (const phrase of acceptPriority) {
-                  const match = candidates.find(c =>
-                    c.text === phrase ||
-                    c.ariaLabel === phrase ||
-                    c.title === phrase ||
-                    c.combined.includes(phrase)
-                  );
-                  if (match) {
-                    console.log(`✅ Clicked consent accept element: "${match.text || match.ariaLabel || match.title}" in frame: ${frame.url()}`);
-                    await match.btn.click().catch(() => {});
-                    clickedAny = true;
-                    clickedInFrame = true;
-                    await page.waitForTimeout(500);
-                    break;
                   }
-                }
 
-                // Pass 2 (fallback): generic positive consent wording only
-                if (!clickedInFrame) {
+                  for (const phrase of acceptPriority) {
+                    const match = candidates.find(c => {
+                      if (phrase === "ok" || phrase === "okay" || phrase === "agree" || phrase === "allow" || phrase === "continue") {
+                        const words = c.text.split(/\s+/);
+                        return words.includes(phrase) || c.text === phrase;
+                      }
+                      return c.text === phrase || c.ariaLabel === phrase || c.title === phrase || c.combined.includes(phrase);
+                    });
+
+                    if (match) {
+                      match.btn.click();
+                      return { clicked: true, text: match.text || match.ariaLabel || "button" };
+                    }
+                  }
+
                   const generic = candidates.find(c =>
                     c.combined.includes("accept") || c.combined.includes("agree")
                   );
                   if (generic) {
-                    console.log(`✅ Clicked generic consent accept: "${generic.text || generic.ariaLabel || generic.title}" in frame: ${frame.url()}`);
-                    await generic.btn.click().catch(() => {});
-                    clickedAny = true;
-                    await page.waitForTimeout(500);
+                    generic.btn.click();
+                    return { clicked: true, text: generic.text || "generic button" };
                   }
+
+                  return { clicked: false };
+                }, { acceptPriority, negativeWords, socialOrLoginKeywords });
+
+                if (clicked && clicked.clicked) {
+                  console.log(`✅ Clicked consent accept element: "${clicked.text}" in frame: ${frame.url()}`);
+                  clickedAny = true;
+                  await page.waitForTimeout(500);
                 }
               } catch (_) {}
             }
