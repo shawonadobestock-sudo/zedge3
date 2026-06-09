@@ -304,7 +304,7 @@ jobs:
           const zedgePassword = process.env.ZEDGE_PASSWORD;
           const isHeadless = process.env.HEADLESS === "true";
 
-          const firebaseDatabaseURL = "https://zedge-automation-3-default-rtdb.asia-southeast1.firebasedatabase.app";
+          const firebaseDatabaseURL = "https://zedge-automation-2-default-rtdb.asia-southeast1.firebasedatabase.app";
           const queuePath = "wallpaperQueue";
           const r2WorkerUrl = "https://frosty-pine-2f7dzedge-r2-gateway.holaexplainer.workers.dev"; // Update to your Cloudflare Worker URL
 
@@ -663,6 +663,44 @@ jobs:
             await locator.click();
           }
 
+          async function safeClickWithPopupRecovery(page, locator, label, timeout = 30000, retries = 4) {
+            let lastErr = null;
+            for (let attempt = 1; attempt <= retries; attempt++) {
+              try {
+                await dismissConsentPopup(page);
+                await page.waitForTimeout(300);
+                await safeClick(locator, `${label} (attempt ${attempt}/${retries})`, timeout);
+                return;
+              } catch (err) {
+                lastErr = err;
+                console.log(`⚠️ Click failed for ${label} on attempt ${attempt}: ${err.message}`);
+                await dismissConsentPopup(page).catch(() => {});
+                await page.evaluate(() => {
+                  document.body.style.overflow = "";
+                  document.documentElement.style.overflow = "";
+                  const nodes = [...document.querySelectorAll("*")];
+                  let touched = 0;
+                  for (const el of nodes) {
+                    try {
+                      const s = window.getComputedStyle(el);
+                      if ((s.position === "fixed" || s.position === "sticky") &&
+                          parseInt(s.zIndex || "0", 10) >= 999 &&
+                          el.offsetWidth >= window.innerWidth * 0.9 &&
+                          el.offsetHeight >= window.innerHeight * 0.6) {
+                        el.style.pointerEvents = "none";
+                        el.style.display = "none";
+                        touched++;
+                      }
+                    } catch (_) {}
+                  }
+                  return touched;
+                }).catch(() => {});
+                await page.waitForTimeout(700);
+              }
+            }
+            throw new Error(`Failed to click ${label} after ${retries} attempts. Last error: ${lastErr?.message || "unknown"}`);
+          }
+
           async function safeType(locator, value, label) {
             console.log(`Typing ${label}`);
             await locator.waitFor({ state: "visible" });
@@ -708,7 +746,16 @@ jobs:
               "agree to all",
               "accept cookies",
               "i agree",
-              "agree"
+              "agree",
+              "allow all",
+              "allow",
+              "continue",
+              "accept & continue",
+              "got it",
+              "ok",
+              "okay",
+              "proceed",
+              "understand"
             ];
 
             // Hard negative guard: never click these
@@ -1555,6 +1602,8 @@ jobs:
               try {
                 // Wait for Didomi modal to appear (with timeout)
                 const didomiModal = page.locator('#didomi-host');
+                console.log("Waiting up to 8s for Didomi host to become visible...");
+                await didomiModal.waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
                 const modalVisible = await didomiModal.isVisible().catch(() => false);
                 
                 if (modalVisible) {
@@ -1562,7 +1611,8 @@ jobs:
                   
                   // Try to click Accept/Close button
                   const acceptButton = page.locator('#didomi-notice-agree-button');
-                  const acceptExists = await acceptButton.isVisible({ timeout: 3000 }).catch(() => false);
+                  await acceptButton.waitFor({ state: 'visible', timeout: 3000 }).catch(() => {});
+                  const acceptExists = await acceptButton.isVisible().catch(() => false);
                   
                   if (acceptExists) {
                     console.log('Clicking "Accept All Cookies" or "Close" button...');
@@ -1572,7 +1622,8 @@ jobs:
                   } else {
                     // Fallback: Try "Do not Share/Sell" button if Accept not found
                     const learnMoreButton = page.locator('#didomi-notice-learn-more-button');
-                    const learnMoreExists = await learnMoreButton.isVisible({ timeout: 2000 }).catch(() => false);
+                    await learnMoreButton.waitFor({ state: 'visible', timeout: 2000 }).catch(() => {});
+                    const learnMoreExists = await learnMoreButton.isVisible().catch(() => false);
                     
                     if (learnMoreExists) {
                       console.log('Clicking "Do not Share or Sell my Personal Information" button...');
@@ -1600,10 +1651,12 @@ jobs:
                 console.log("Attempting to proceed with login anyway...");
               }
 
-              await safeClick(
+              await safeClickWithPopupRecovery(
+                page,
                 page.locator('[data-hook="za-login-email"]').first(),
                 "Continue with Email",
-                30000
+                30000,
+                5
               );
 
               await safeType(
@@ -1830,7 +1883,7 @@ jobs:
           HEADLESS: ${{ github.event.inputs.headless }}
           TOTAL_PROFILES: ${{ github.event.inputs.total_profiles }}
           UA_GROUP: ${{ github.event.inputs.ua_group }}
-          FOLDER_NAME: "Zedge 3"
+          FOLDER_NAME: "Zedge 2"
 
         run: node bot.js
 
