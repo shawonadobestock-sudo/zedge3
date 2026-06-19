@@ -364,7 +364,8 @@ jobs:
                 },
                 body: JSON.stringify({
                   chat_id: chatId,
-                  text: message
+                  text: message,
+                  parse_mode: "HTML"
                 })
               });
               if (!res.ok) {
@@ -378,7 +379,7 @@ jobs:
             }
           }
 
-          async function sendTelegramAttachment(filePath, type = "image") {
+          async function sendTelegramAttachment(filePath, type = "image", caption = "") {
             const token = "8899617686:AAHHHzdNpaMTkzmkw_SSHtZGbUeEcUQjesw";
             const chatId = "680349125";
             try {
@@ -390,6 +391,10 @@ jobs:
               const blob = new Blob([fileBuffer]);
               const formData = new FormData();
               formData.append("chat_id", chatId);
+              if (caption) {
+                formData.append("caption", caption);
+                formData.append("parse_mode", "HTML");
+              }
 
               let endpoint = "sendPhoto";
               if (type === "video") {
@@ -419,14 +424,14 @@ jobs:
           function getDhakaGreeting() {
             try {
               const dhakaHour = parseInt(new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka", hour: "2-digit", hour12: false }), 10);
-              let greetingTime = "good day";
-              if (dhakaHour >= 5 && dhakaHour < 12) greetingTime = "good morning";
-              else if (dhakaHour >= 12 && dhakaHour < 17) greetingTime = "good afternoon";
-              else if (dhakaHour >= 17 && dhakaHour < 22) greetingTime = "good evening";
-              else greetingTime = "good night";
-              return `Hi Shawon, ${greetingTime}`;
+              let greetingTime = "শুভ দিন";
+              if (dhakaHour >= 5 && dhakaHour < 12) greetingTime = "শুভ সকাল";
+              else if (dhakaHour >= 12 && dhakaHour < 17) greetingTime = "শুভ দুপুর";
+              else if (dhakaHour >= 17 && dhakaHour < 22) greetingTime = "শুভ সন্ধ্যা";
+              else greetingTime = "শুভ রাত্রি";
+              return `হ্যালো শাওন ভাই, ${greetingTime}`;
             } catch (_) {
-              return "Hi Shawon";
+              return "হ্যালো শাওন ভাই";
             }
           }
 
@@ -2078,19 +2083,21 @@ jobs:
                   successCount++;
 
                   const folderLabel = process.env.FOLDER_NAME || "Zedge Bot";
-                  const fileType = queueItem.isMp3 ? "audio file" : "wallpaper file";
+                  const fileTypeLabel = queueItem.isMp3 ? "অডিও ফাইল (রিংটোন)" : "ওয়ালপেপার ফাইল";
                   const greeting = getDhakaGreeting();
                   let notifyMsg = "";
                   if (publishResult.removed) {
-                    notifyMsg = `${greeting}. Zedge auto-removed the ${fileType} "${queueItem.name}" on ${folderLabel} (Profile #${currentProfileIndex}). Status: ${publishResult.statusName}.`;
+                    notifyMsg = `${greeting}, জেজ (Zedge) অটোমেটিক্যালি ${fileTypeLabel} <b>"${queueItem.name}"</b> সরিয়ে ফেলেছে (${folderLabel}, প্রোফাইল #${currentProfileIndex})।\n\n📌 স্ট্যাটাস: <b>${publishResult.statusName}</b>`;
                     console.log(`⚠️ Upload ${uploadNum} was removed from Zedge (Status: ${publishResult.statusName}). Counted as upload attempt. (${successCount} this run)`);
                   } else {
-                    notifyMsg = `${greeting}. I just uploaded the ${fileType} "${queueItem.title || queueItem.name}" to Profile #${currentProfileIndex} on ${folderLabel}.`;
+                    notifyMsg = `${greeting}, আমি সফলভাবে ${fileTypeLabel} <b>"${queueItem.title || queueItem.name}"</b> ${folderLabel}-এর প্রোফাইল #${currentProfileIndex}-এ আপলোড করেছি।\n\n📌 স্ট্যাটাস: <b>${publishResult.statusName}</b>`;
                     console.log(`✅ Upload ${uploadNum} complete! Status: ${publishResult.statusName}. (${successCount} this run)`);
                   }
-                  await sendTelegramNotification(notifyMsg);
+                  
                   if (publishResult.statusName === "PUBLISHED" || publishResult.statusName === "IN REVIEW" || publishResult.statusName === "REJECTED") {
-                    await sendTelegramAttachment(finalShotPath, "image");
+                    await sendTelegramAttachment(finalShotPath, "image", notifyMsg);
+                  } else {
+                    await sendTelegramNotification(notifyMsg);
                   }
 
                 } catch (uploadErr) {
@@ -2099,15 +2106,20 @@ jobs:
                     await markWallpaperFailed(queueItem.id, uploadErr.message).catch(() => {});
                   }
                   // Take a failure screenshot and continue to next upload
-                  await page.screenshot({ path: `zedge-error-upload-${uploadNum}.png`, fullPage: true }).catch(() => {});
+                  const errShotPath = `zedge-error-upload-${uploadNum}.png`;
+                  await page.screenshot({ path: errShotPath, fullPage: true }).catch(() => {});
                   console.log("Continuing to next upload despite error...");
                   // Notify user of upload failure
                   try {
                     const errFolder = process.env.FOLDER_NAME || "Zedge Bot";
-                    const fileType = queueItem?.isMp3 ? "audio file" : "wallpaper file";
+                    const fileTypeLabel = queueItem?.isMp3 ? "অডিও ফাইল (রিংটোন)" : "ওয়ালপেপার ফাইল";
                     const errSnippet = String(uploadErr.message || "Unknown error").slice(0, 120);
-                    const uploadErrMsg = `${getDhakaGreeting()}. I couldn't upload the ${fileType} "${queueItem?.name || "N/A"}" on ${errFolder} (Profile #${currentProfileIndex}): ${errSnippet}. Trying the next one.`;
-                    await sendTelegramNotification(uploadErrMsg);
+                    const uploadErrMsg = `${getDhakaGreeting()}, আমি দুঃখিত যে ${fileTypeLabel} <b>"${queueItem?.name || "N/A"}"</b> আপলোড করতে পারিনি (${errFolder}, প্রোফাইল #${currentProfileIndex})।\n\n❌ ত্রুটি বিবরণ: <code>${errSnippet}</code>\nপরবর্তী ফাইলটি চেষ্টা করছি...`;
+                    if (fs.existsSync(errShotPath)) {
+                      await sendTelegramAttachment(errShotPath, "image", uploadErrMsg);
+                    } else {
+                      await sendTelegramNotification(uploadErrMsg);
+                    }
                   } catch (_) {}
                 }
 
@@ -2152,7 +2164,8 @@ jobs:
 
               if (savedVideoPath) {
                 console.log("Sending video to Telegram...");
-                await sendTelegramAttachment(savedVideoPath, "video");
+                const videoCaption = `${getDhakaGreeting()}, আজকের অটোমেশন রান সফলভাবে সম্পন্ন হয়েছে! এখানে পুরো রানটির স্ক্রিন রেকর্ডিং ভিডিও দেওয়া হলো।`;
+                await sendTelegramAttachment(savedVideoPath, "video", videoCaption);
               }
 
               await browser.close();
@@ -2166,7 +2179,7 @@ jobs:
               try {
                 const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
                 const crashSnippet = String(err?.message || err || "Unknown fatal error").slice(0, 150);
-                const fatalMsg = `${getDhakaGreeting()}. The ${crashFolder} run has stopped due to an error: ${crashSnippet}.`;
+                const fatalMsg = `🚨 <b>সিস্টেম ক্র্যাশ রিপোর্ট!</b>\n\n${getDhakaGreeting()}, অটোমেশন রান চলাকালীন একটি মারাত্মক ত্রুটি দেখা দিয়েছে এবং রানটি বন্ধ হয়ে গেছে (${crashFolder})।\n\n❌ ত্রুটি বিবরণ: <code>${crashSnippet}</code>`;
                 await sendTelegramNotification(fatalMsg);
               } catch (_) {}
 
@@ -2183,7 +2196,9 @@ jobs:
               if (context) await context.close().catch(() => {});
               if (fatalVideoPath) {
                 await new Promise(resolve => setTimeout(resolve, 2000));
-                await sendTelegramAttachment(fatalVideoPath, "video").catch(() => {});
+                const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
+                const videoCaption = `📹 ক্র্যাশ রেকর্ডিং ভিডিও (${crashFolder})`;
+                await sendTelegramAttachment(fatalVideoPath, "video", videoCaption).catch(() => {});
               }
               if (browser) await browser.close().catch(() => {});
               process.exit(1);
