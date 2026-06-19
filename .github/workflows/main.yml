@@ -352,65 +352,66 @@ jobs:
             console.log(`Deleted from Firebase: ${pathName}`);
           }
 
-          async function sendFacebookNotification(message) {
-            const token = "EAASk1dgl5aIBRmpwb76F9wMCVc6S4Acd3ZC6Ibv5PkyJ1SN9fGuUnzPXyUBiZBvP30EgRqis5lfuAPK6hJ1yeqWHDQZBnhLkyr9VdxkKkoeU7W1pzlBAZC93ZAqZChNrrtgwXI0l0D30WBV53wUINdTrSi8vQ0y8mi5ygTBysBlUkNBvKPnmY9PZBg5qOroV8CVzxyCre4PagZDZD";
-            const psid = "27204362879257816";
+          async function sendTelegramNotification(message) {
+            const token = "8899617686:AAHHHzdNpaMTkzmkw_SSHtZGbUeEcUQjesw";
+            const chatId = "680349125";
             try {
-              const url = `https://graph.facebook.com/v20.0/me/messages?access_token=${token}`;
+              const url = `https://api.telegram.org/bot${token}/sendMessage`;
               const res = await fetch(url, {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/json"
                 },
                 body: JSON.stringify({
-                  recipient: { id: psid },
-                  message: { text: message }
+                  chat_id: chatId,
+                  text: message
                 })
               });
               if (!res.ok) {
                 const errText = await res.text().catch(() => "");
-                console.log(`Facebook Graph API response failed: HTTP ${res.status} - ${errText}`);
+                console.log(`Telegram API response failed: HTTP ${res.status} - ${errText}`);
               } else {
-                console.log("Facebook notification successfully sent via Graph API.");
+                console.log("Telegram notification successfully sent.");
               }
             } catch (err) {
-              console.log(`Error sending Facebook notification: ${err.message}`);
+              console.log(`Error sending Telegram notification: ${err.message}`);
             }
           }
 
-          async function sendFacebookAttachment(filePath, type = "image") {
-            const token = "EAASk1dgl5aIBRmpwb76F9wMCVc6S4Acd3ZC6Ibv5PkyJ1SN9fGuUnzPXyUBiZBvP30EgRqis5lfuAPK6hJ1yeqWHDQZBnhLkyr9VdxkKkoeU7W1pzlBAZC93ZAqZChNrrtgwXI0l0D30WBV53wUINdTrSi8vQ0y8mi5ygTBysBlUkNBvKPnmY9PZBg5qOroV8CVzxyCre4PagZDZD";
-            const psid = "27204362879257816";
+          async function sendTelegramAttachment(filePath, type = "image") {
+            const token = "8899617686:AAHHHzdNpaMTkzmkw_SSHtZGbUeEcUQjesw";
+            const chatId = "680349125";
             try {
               if (!fs.existsSync(filePath)) {
-                console.log(`Facebook attachment file not found: ${filePath}`);
+                console.log(`Telegram attachment file not found: ${filePath}`);
                 return;
               }
               const fileBuffer = fs.readFileSync(filePath);
               const blob = new Blob([fileBuffer]);
               const formData = new FormData();
-              formData.append("recipient", JSON.stringify({ id: psid }));
-              formData.append("message", JSON.stringify({
-                attachment: {
-                  type: type,
-                  payload: { is_reusable: true }
-                }
-              }));
-              formData.append("filedata", blob, path.basename(filePath));
+              formData.append("chat_id", chatId);
 
-              const url = `https://graph.facebook.com/v20.0/me/messages?access_token=${token}`;
+              let endpoint = "sendPhoto";
+              if (type === "video") {
+                endpoint = "sendVideo";
+                formData.append("video", blob, path.basename(filePath));
+              } else {
+                formData.append("photo", blob, path.basename(filePath));
+              }
+
+              const url = `https://api.telegram.org/bot${token}/${endpoint}`;
               const res = await fetch(url, {
                 method: "POST",
                 body: formData
               });
               if (!res.ok) {
                 const errText = await res.text().catch(() => "");
-                console.log(`Facebook attachment (${type}) send failed: HTTP ${res.status} - ${errText}`);
+                console.log(`Telegram attachment (${type}) send failed: HTTP ${res.status} - ${errText}`);
               } else {
-                console.log(`Facebook attachment (${type}) successfully sent.`);
+                console.log(`Telegram attachment (${type}) successfully sent.`);
               }
             } catch (err) {
-              console.log(`Error sending Facebook attachment (${type}): ${err.message}`);
+              console.log(`Error sending Telegram attachment (${type}): ${err.message}`);
             }
           }
 
@@ -2087,9 +2088,9 @@ jobs:
                     notifyMsg = `${greeting}. I just uploaded the ${fileType} "${queueItem.title || queueItem.name}" to Profile #${currentProfileIndex} on ${folderLabel}.`;
                     console.log(`✅ Upload ${uploadNum} complete! Status: ${publishResult.statusName}. (${successCount} this run)`);
                   }
-                  await sendFacebookNotification(notifyMsg);
+                  await sendTelegramNotification(notifyMsg);
                   if (publishResult.statusName === "PUBLISHED" || publishResult.statusName === "IN REVIEW" || publishResult.statusName === "REJECTED") {
-                    await sendFacebookAttachment(finalShotPath, "image");
+                    await sendTelegramAttachment(finalShotPath, "image");
                   }
 
                 } catch (uploadErr) {
@@ -2106,7 +2107,7 @@ jobs:
                     const fileType = queueItem?.isMp3 ? "audio file" : "wallpaper file";
                     const errSnippet = String(uploadErr.message || "Unknown error").slice(0, 120);
                     const uploadErrMsg = `${getDhakaGreeting()}. I couldn't upload the ${fileType} "${queueItem?.name || "N/A"}" on ${errFolder} (Profile #${currentProfileIndex}): ${errSnippet}. Trying the next one.`;
-                    await sendFacebookNotification(uploadErrMsg);
+                    await sendTelegramNotification(uploadErrMsg);
                   } catch (_) {}
                 }
 
@@ -2150,8 +2151,8 @@ jobs:
               console.log("✅ Video recording finalized.");
 
               if (savedVideoPath) {
-                console.log("Sending video to Facebook...");
-                await sendFacebookAttachment(savedVideoPath, "video");
+                console.log("Sending video to Telegram...");
+                await sendTelegramAttachment(savedVideoPath, "video");
               }
 
               await browser.close();
@@ -2166,7 +2167,7 @@ jobs:
                 const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
                 const crashSnippet = String(err?.message || err || "Unknown fatal error").slice(0, 150);
                 const fatalMsg = `${getDhakaGreeting()}. The ${crashFolder} run has stopped due to an error: ${crashSnippet}.`;
-                await sendFacebookNotification(fatalMsg);
+                await sendTelegramNotification(fatalMsg);
               } catch (_) {}
 
               let fatalVideoPath = "";
@@ -2182,7 +2183,7 @@ jobs:
               if (context) await context.close().catch(() => {});
               if (fatalVideoPath) {
                 await new Promise(resolve => setTimeout(resolve, 2000));
-                await sendFacebookAttachment(fatalVideoPath, "video").catch(() => {});
+                await sendTelegramAttachment(fatalVideoPath, "video").catch(() => {});
               }
               if (browser) await browser.close().catch(() => {});
               process.exit(1);
